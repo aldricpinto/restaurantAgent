@@ -72,7 +72,7 @@ class OpheliaAPIClient:
         return headers
 
     async def search_venues(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/venues/search", json=payload, timeout=60)
+        return await self._request("POST", "/venues/search", json=payload, timeout=90)
 
     async def search_availability(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/availability/search", json=payload, timeout=60)
