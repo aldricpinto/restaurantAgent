@@ -23,14 +23,61 @@ from utils.logger import agent_logger as logger
 load_dotenv()
 
 
-TERMINAL_STATUSES = {"confirmed", "failed", "cancelled", "expired", "rate_limited", "error"}
+TERMINAL_STATUSES = {"confirmed", "failed", "cancelled", "expired", "rate_limited", "error", "verification_required"}
 MAX_POLL_ATTEMPTS = 5
+POST_CONTINUE_SETTLE_SECONDS = 180
+POST_CONTINUE_SETTLE_INTERVAL_SECONDS = 10
+WAITABLE_PROVIDER_ERROR_CODES = {"not_confirmed_after_otp"}
+DESIRED_LOCATIONS = [
+    {
+        "key": "central_park",
+        "label": "Central Park",
+        "search_location": "Central Park, New York, NY",
+        "aliases": [
+            "central park",
+            "nyc near central park",
+            "new york near central park",
+            "near central park",
+            "near central park in nyc",
+            "near central park in new york",
+        ],
+    },
+    {
+        "key": "soho",
+        "label": "SoHo",
+        "search_location": "SoHo, New York, NY",
+        "aliases": ["soho", "soho nyc", "soho new york", "soho manhattan"],
+    },
+    {
+        "key": "times_square",
+        "label": "Times Square",
+        "search_location": "Times Square, New York, NY",
+        "aliases": [
+            "times square",
+            "nyc near times square",
+            "new york near times square",
+            "near times square",
+        ],
+    },
+    {
+        "key": "west_village",
+        "label": "West Village",
+        "search_location": "West Village, New York, NY",
+        "aliases": ["west village", "west village nyc", "west village new york"],
+    },
+]
+LOCATION_CHOICES = [
+    f"{idx}. {location['label']} — {location['search_location']}"
+    for idx, location in enumerate(DESIRED_LOCATIONS, start=1)
+]
 
 
 class BookingState(TypedDict, total=False):
     user_request: str
     vertical: str
     term: str
+    raw_location: str
+    desired_location_key: str
     location: str
     datetime_phrase: str
     booking_datetime: str
@@ -157,6 +204,65 @@ def normalize_datetime(datetime_phrase: str, user_request: str) -> str | None:
     return parsed.replace(microsecond=0).isoformat()
 
 
+def format_api_datetime(datetime_value: str) -> str:
+    """
+    Ophelia availability expects an ISO timestamp with a Z suffix.
+    The MVP stores local wall time as YYYY-MM-DDTHH:MM:SS, so format it
+    consistently for the REST payload without changing the selected time.
+    """
+    value = (datetime_value or "").strip()
+    if not value:
+        return value
+    if value.endswith("Z"):
+        return value
+    if re.search(r"[+-]\d{2}:\d{2}$", value):
+        return value
+    return f"{value}Z"
+
+
+def parse_desired_location(location_phrase: str, user_request: str = "") -> tuple[str, str]:
+    """
+    This function will help match natural-language location text against the user's predefined
+    desired locations. Returns (search_location, desired_location_key).
+    """
+    source = f"{location_phrase or ''} {user_request or ''}".lower()
+    source = re.sub(r"\s+", " ", source).strip()
+    if not source:
+        return "", ""
+
+    alias_candidates: list[tuple[int, dict[str, Any]]] = []
+    for location in DESIRED_LOCATIONS:
+        aliases = [location["label"], location["search_location"], *location["aliases"]]
+        for alias in aliases:
+            alias_lower = alias.lower()
+            if alias_lower and alias_lower in source:
+                alias_candidates.append((len(alias_lower), location))
+
+    if not alias_candidates:
+        return "", ""
+
+    _, selected = max(alias_candidates, key=lambda item: item[0])
+    return selected["search_location"], selected["key"]
+
+
+def location_from_answer(answer: Any, fallback_location: str = "", fallback_key: str = "") -> tuple[str, str]:
+    raw = str(answer or "").strip()
+    if not raw:
+        return fallback_location, fallback_key
+
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(DESIRED_LOCATIONS):
+            selected = DESIRED_LOCATIONS[idx]
+            return selected["search_location"], selected["key"]
+
+    matched_location, matched_key = parse_desired_location(raw)
+    if matched_location:
+        return matched_location, matched_key
+
+    return raw, ""
+
+
 def required_missing(state: BookingState) -> list[str]:
     missing: list[str] = []
     for field in ("term", "location", "booking_datetime", "party_size"):
@@ -175,12 +281,85 @@ def venue_display(venue: dict[str, Any]) -> str:
     return f"{venue.get('name', 'Unknown venue')} ({venue.get('id')}) — {address} [{provider}]"
 
 
+def selected_provider(state: BookingState) -> str:
+    return str(
+        state.get("selected_venue", {}).get("provider")
+        or state.get("selected_venue", {}).get("source")
+        or ""
+    ).strip().lower()
+
+
+def requested_time_label(booking_datetime: str) -> str:
+    try:
+        parsed = dt.datetime.fromisoformat((booking_datetime or "").replace("Z", ""))
+    except ValueError:
+        return ""
+    return parsed.strftime("%I:%M %p").lstrip("0")
+
+
 def safe_error_state(error: OpheliaAPIError) -> dict[str, Any]:
     return {
         "booking_status": "error",
         "error": error.to_state_error(),
         "booking_response": {},
     }
+
+
+def booking_error_code(response: dict[str, Any]) -> str | None:
+    for key in ("error_code", "code"):
+        value = response.get(key)
+        if isinstance(value, str):
+            return value
+
+    error = response.get("error")
+    if isinstance(error, dict):
+        for key in ("error_code", "code", "type"):
+            value = error.get(key)
+            if isinstance(value, str):
+                return value
+    if isinstance(error, str):
+        return error
+
+    metadata = response.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("error_code", "code"):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                return value
+
+    return None
+
+
+def has_confirmation_evidence(response: dict[str, Any]) -> bool:
+    if not isinstance(response, dict):
+        return False
+
+    provider_booking_id = response.get("provider_booking_id")
+    if isinstance(provider_booking_id, str) and provider_booking_id.strip():
+        return True
+
+    confirmation = response.get("confirmation")
+    if isinstance(confirmation, dict):
+        for key in ("confirmation_code", "confirmation_number", "number", "code"):
+            value = confirmation.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+
+    metadata = response.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("confirmation_code", "confirmation_number", "provider_booking_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+
+    return False
+
+
+def public_status_from_booking_response(response: dict[str, Any]) -> str:
+    status = response.get("status", "unknown")
+    if status == "confirmed" and not has_confirmation_evidence(response):
+        return "verification_required"
+    return status
 
 
 async def main() -> None:
@@ -228,6 +407,8 @@ User request: {user_request}
         vertical = parsed.get("vertical") or "dining"
         datetime_phrase = parsed.get("datetime_phrase") or ""
         booking_datetime = normalize_datetime(datetime_phrase, user_request)
+        raw_location = parsed.get("location") or ""
+        location, desired_location_key = parse_desired_location(raw_location, user_request)
         party_size = parsed.get("party_size")
         try:
             party_size = int(party_size) if party_size is not None else None
@@ -237,7 +418,9 @@ User request: {user_request}
         update: BookingState = {
             "vertical": vertical,
             "term": parsed.get("term") or "",
-            "location": parsed.get("location") or "",
+            "raw_location": raw_location,
+            "desired_location_key": desired_location_key,
+            "location": location,
             "datetime_phrase": datetime_phrase,
             "preferences": parsed.get("preferences") or {},
             "venues": [],
@@ -272,17 +455,24 @@ User request: {user_request}
                 "fields_needed": missing,
                 "known": {
                     "term": state.get("term"),
+                    "raw_location": state.get("raw_location"),
                     "location": state.get("location"),
                     "datetime_phrase": state.get("datetime_phrase"),
                     "booking_datetime": state.get("booking_datetime"),
                     "party_size": state.get("party_size"),
                 },
+                "location_choices": LOCATION_CHOICES,
             }
         )
 
         user_request = state.get("user_request", "")
         term = answers.get("term") or state.get("term", "")
-        location = answers.get("location") or state.get("location", "")
+        raw_location = answers.get("location") or answers.get("raw_location") or state.get("raw_location", "")
+        location, desired_location_key = location_from_answer(
+            raw_location,
+            fallback_location=state.get("location", ""),
+            fallback_key=state.get("desired_location_key", ""),
+        )
         datetime_phrase = answers.get("datetime") or answers.get("datetime_phrase") or state.get("datetime_phrase", "")
         booking_datetime = normalize_datetime(datetime_phrase, f"{user_request} {datetime_phrase}")
         party_size = answers.get("party_size") or state.get("party_size")
@@ -293,6 +483,8 @@ User request: {user_request}
 
         update: BookingState = {
             "term": term,
+            "raw_location": raw_location,
+            "desired_location_key": desired_location_key,
             "location": location,
             "datetime_phrase": datetime_phrase,
             "missing_fields": [],
@@ -372,11 +564,44 @@ User request: {user_request}
                 "error": {"category": "validation", "message": "No selected venue ID found."},
             }
 
+        if selected_provider(state) == "opentable":
+            selected_venue = state.get("selected_venue", {})
+            inline_times = selected_venue.get("available_times") or []
+            requested_time = requested_time_label(state.get("booking_datetime", ""))
+            logger.info(
+                "availability_node: skipping standalone availability for OpenTable; inline_times=%s requested_time=%s",
+                inline_times,
+                requested_time,
+            )
+            if not inline_times:
+                return {
+                    "booking_status": "failed",
+                    "error": {
+                        "category": "provider_terminal",
+                        "message": "OpenTable did not return inline availability for the selected venue.",
+                    },
+                    "availability": {
+                        "source": "venues/search.inline",
+                        "provider": "opentable",
+                        "available_times": [],
+                    },
+                }
+
+            return {
+                "availability": {
+                    "source": "venues/search.inline",
+                    "provider": "opentable",
+                    "available_times": inline_times,
+                    "requested_time": requested_time,
+                    "requested_time_available": requested_time in inline_times if requested_time else None,
+                }
+            }
+
         payload = {
-            "vertical": "dining",
             "venue_id": venue_id,
-            "datetime": state["booking_datetime"],
             "party_size": int(state["party_size"]),
+            "datetime": format_api_datetime(state["booking_datetime"]),
+            "window_minutes": 60,
         }
         logger.info("availability_node: payload=%s", redact(payload))
         try:
@@ -469,10 +694,10 @@ User request: {user_request}
             logger.warning("create_booking_node: Ophelia API error=%s", exc.to_state_error())
             return safe_error_state(exc) | {"idempotency_key": idempotency_key}
 
-        status = response.get("status", "unknown")
+        status = public_status_from_booking_response(response)
         if status == "failed":
             increment_failures(venue_id)
-        elif status in {"confirmed", "requires_action", "processing"}:
+        elif status in {"confirmed", "requires_action", "processing", "verification_required"}:
             clear_failures(venue_id)
 
         return {
@@ -513,10 +738,88 @@ User request: {user_request}
             logger.warning("poll_booking_node: Ophelia API error=%s", exc.to_state_error())
             return safe_error_state(exc)
         return {
-            "booking_status": response.get("status", "unknown"),
+            "booking_status": public_status_from_booking_response(response),
             "booking_response": response,
             "next_action": response.get("next_action") or {},
             "poll_attempts": attempts + 1,
+        }
+
+    async def reconcile_booking_after_timeout(booking_id: str, source: str) -> dict[str, Any]:
+        logger.info("%s: reconciling booking_id=%s after timeout/network error", source, booking_id)
+        try:
+            response = await api.get_booking(booking_id)
+        except OpheliaAPIError as exc:
+            logger.warning("%s: reconciliation failed=%s", source, exc.to_state_error())
+            return safe_error_state(exc) | {"booking_id": booking_id}
+
+        return {
+            "booking_id": booking_id,
+            "booking_status": public_status_from_booking_response(response),
+            "booking_response": response,
+            "next_action": response.get("next_action") or {},
+            "poll_attempts": 0,
+        }
+
+    async def wait_for_provider_settle_after_continue(
+        booking_id: str,
+        initial_response: dict[str, Any],
+    ) -> dict[str, Any]:
+        error_code = booking_error_code(initial_response)
+        if initial_response.get("status") in TERMINAL_STATUSES or error_code not in WAITABLE_PROVIDER_ERROR_CODES:
+            return {
+                "booking_status": public_status_from_booking_response(initial_response),
+                "booking_response": initial_response,
+                "next_action": initial_response.get("next_action") or {},
+            }
+
+        logger.info(
+            "continue_booking_node: provider returned waitable failure error_code=%s; polling booking_id=%s for up to %ss",
+            error_code,
+            booking_id,
+            POST_CONTINUE_SETTLE_SECONDS,
+        )
+        print(
+            "\nProvider has not reached the confirmation page yet. "
+            f"I'll wait up to {POST_CONTINUE_SETTLE_SECONDS} seconds and keep checking the booking status..."
+        )
+
+        deadline = dt.datetime.now() + dt.timedelta(seconds=POST_CONTINUE_SETTLE_SECONDS)
+        latest_response = initial_response
+        while dt.datetime.now() < deadline:
+            await asyncio.sleep(POST_CONTINUE_SETTLE_INTERVAL_SECONDS)
+            try:
+                latest_response = await api.get_booking(booking_id)
+            except OpheliaAPIError as exc:
+                logger.warning("continue_booking_node: settle poll failed=%s", exc.to_state_error())
+                continue
+
+            latest_status = public_status_from_booking_response(latest_response)
+            latest_error_code = booking_error_code(latest_response)
+            logger.info(
+                "continue_booking_node: settle poll status=%s error_code=%s",
+                latest_status,
+                latest_error_code,
+            )
+
+            if latest_status in TERMINAL_STATUSES or latest_error_code not in WAITABLE_PROVIDER_ERROR_CODES:
+                return {
+                    "booking_id": booking_id,
+                    "booking_status": latest_status,
+                    "booking_response": latest_response,
+                    "next_action": latest_response.get("next_action") or {},
+                    "poll_attempts": 0,
+                }
+
+        logger.info(
+            "continue_booking_node: settle window expired for booking_id=%s; accepting latest failed status",
+            booking_id,
+        )
+        return {
+            "booking_id": booking_id,
+            "booking_status": public_status_from_booking_response(latest_response),
+            "booking_response": latest_response,
+            "next_action": latest_response.get("next_action") or {},
+            "poll_attempts": 0,
         }
 
     async def continue_booking_node(state: BookingState) -> dict[str, Any]:
@@ -560,13 +863,11 @@ User request: {user_request}
             response = await api.continue_booking(booking_id, payload)
         except OpheliaAPIError as exc:
             logger.warning("continue_booking_node: Ophelia API error=%s", exc.to_state_error())
+            if exc.category == "network":
+                return await reconcile_booking_after_timeout(booking_id, "continue_booking_node")
             return safe_error_state(exc)
 
-        return {
-            "booking_status": response.get("status", "unknown"),
-            "booking_response": response,
-            "next_action": response.get("next_action") or {},
-        }
+        return await wait_for_provider_settle_after_continue(booking_id, response)
 
     async def summary_node(state: BookingState) -> dict[str, Any]:
         status = state.get("booking_status", "unknown")
@@ -593,6 +894,7 @@ User request: {user_request}
         prompt = f"""
 Write a short user-facing booking result.
 Use only the grounded JSON. Do not imply success unless status is confirmed.
+If status is verification_required, explicitly say the booking could not be verified as confirmed yet.
 If failed/error/rate_limited/expired, be honest and include the sanitized error code if present.
 Please ensure you replace any bracketed placeholders like [Insert Date], [Insert Time],
 [Guest], [Insert Party Size], or [Guest Name] with the actual details provided below.
@@ -718,6 +1020,11 @@ def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
         for choice in payload["choices"]:
             print(choice)
 
+    if payload.get("location_choices"):
+        print("\nLocation choices:")
+        for choice in payload["location_choices"]:
+            print(choice)
+
     if payload.get("booking_details"):
         print("\nBooking details:")
         for key, value in payload["booking_details"].items():
@@ -737,6 +1044,8 @@ def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
             answers[field] = input("Approve booking? Type yes/no: ").strip()
         elif field == "selection":
             answers[field] = input("Selection number: ").strip()
+        elif field == "location":
+            answers[field] = input("Location number or custom location: ").strip()
         elif field == "card_cvv":
             answers[field] = input(f"{label}: ").strip()
         elif field == "otp_code":

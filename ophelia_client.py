@@ -1,9 +1,12 @@
 import os
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+
+logger = logging.getLogger("ophelia.agent")
 
 SENSITIVE_KEYS = {
     "authorization",
@@ -72,7 +75,7 @@ class OpheliaAPIClient:
         return headers
 
     async def search_venues(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/venues/search", json=payload, timeout=90)
+        return await self._request("POST", "/venues/search", json=payload, timeout=150)
 
     async def search_availability(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/availability/search", json=payload, timeout=60)
@@ -83,17 +86,17 @@ class OpheliaAPIClient:
             "/bookings",
             json=payload,
             idempotency_key=idempotency_key,
-            timeout=120,
+            timeout=180,
         )
 
     async def get_booking(self, booking_id: str) -> dict[str, Any]:
-        return await self._request("GET", f"/bookings/{booking_id}", timeout=30)
+        return await self._request("GET", f"/bookings/{booking_id}", timeout=150)
 
     async def continue_booking(self, booking_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", f"/bookings/{booking_id}/continue", json=payload, timeout=60)
+        return await self._request("POST", f"/bookings/{booking_id}/continue", json=payload, timeout=180)
 
     async def cancel_booking(self, booking_id: str) -> dict[str, Any]:
-        return await self._request("POST", f"/bookings/{booking_id}/cancel", timeout=30)
+        return await self._request("POST", f"/bookings/{booking_id}/cancel", timeout=180)
 
     async def _request(
         self,
@@ -105,15 +108,36 @@ class OpheliaAPIClient:
         timeout: float | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
+        headers = self._headers(idempotency_key)
+        safe_headers = redact(headers)
+        timeout_value = timeout or self.timeout
+        logger.debug(
+            "ophelia_api request: method=%s path=%s url=%s timeout=%s headers=%s body=%s",
+            method,
+            path,
+            url,
+            timeout_value,
+            safe_headers,
+            redact(json or {}),
+        )
         try:
-            async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout_value) as client:
                 response = await client.request(
                     method,
                     url,
-                    headers=self._headers(idempotency_key),
+                    headers=headers,
                     json=json,
                 )
         except httpx.TimeoutException as exc:
+            logger.debug(
+                "ophelia_api timeout: method=%s path=%s url=%s timeout=%s body=%s error=%r",
+                method,
+                path,
+                url,
+                timeout_value,
+                redact(json or {}),
+                exc,
+            )
             raise OpheliaAPIError(
                 status_code=None,
                 category="network",
@@ -121,6 +145,15 @@ class OpheliaAPIClient:
                 error_code="timeout",
             ) from exc
         except httpx.HTTPError as exc:
+            logger.debug(
+                "ophelia_api http_error: method=%s path=%s url=%s timeout=%s body=%s error=%r",
+                method,
+                path,
+                url,
+                timeout_value,
+                redact(json or {}),
+                exc,
+            )
             raise OpheliaAPIError(
                 status_code=None,
                 category="network",
@@ -131,6 +164,13 @@ class OpheliaAPIClient:
         try:
             body = response.json() if response.content else {}
         except ValueError as exc:
+            logger.debug(
+                "ophelia_api invalid_json_response: method=%s path=%s status=%s text=%s",
+                method,
+                path,
+                response.status_code,
+                response.text[:2000],
+            )
             raise OpheliaAPIError(
                 status_code=response.status_code,
                 category="network",
@@ -138,8 +178,26 @@ class OpheliaAPIClient:
                 error_code="invalid_json",
             ) from exc
 
+        logger.debug(
+            "ophelia_api response: method=%s path=%s status=%s body=%s",
+            method,
+            path,
+            response.status_code,
+            redact(body),
+        )
+
         if response.status_code >= 400:
-            raise self._error_from_response(response.status_code, body)
+            error = self._error_from_response(response.status_code, body)
+            logger.debug(
+                "ophelia_api error_response: method=%s path=%s status=%s category=%s error_code=%s body=%s",
+                method,
+                path,
+                response.status_code,
+                error.category,
+                error.error_code,
+                redact(body),
+            )
+            raise error
 
         return body
 
