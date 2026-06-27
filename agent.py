@@ -16,6 +16,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from typing_extensions import TypedDict
 
+from memory_store import MemoryStore, build_memory_context
 from ophelia_client import OpheliaAPIClient, OpheliaAPIError, redact
 from utils.logger import agent_logger as logger
 
@@ -70,9 +71,38 @@ LOCATION_CHOICES = [
     f"{idx}. {location['label']} — {location['search_location']}"
     for idx, location in enumerate(DESIRED_LOCATIONS, start=1)
 ]
+VERTICAL_POLICIES = {
+    "dining": {
+        "label": "restaurant",
+        "result_label": "Restaurant Search Result",
+        "required_fields": ("term", "location", "booking_datetime", "party_size"),
+        "default_party_size": None,
+        "include_party_size_in_search": True,
+        "include_party_size_in_booking": True,
+        "needs_password": False,
+        "needs_full_billing_address": False,
+    },
+    "fitness": {
+        "label": "fitness class",
+        "result_label": "Fitness Search Result",
+        "required_fields": ("term", "location", "booking_datetime"),
+        "default_party_size": 1,
+        "include_party_size_in_search": False,
+        "include_party_size_in_booking": False,
+        "needs_password": True,
+        "needs_full_billing_address": True,
+    },
+}
 
 
 class BookingState(TypedDict, total=False):
+    org_id: str
+    user_id: str
+    user_profile: dict[str, Any]
+    memory_events: list[dict[str, Any]]
+    memory_context: str
+    memory_recorded: bool
+    profile_update_recorded: bool
     user_request: str
     vertical: str
     term: str
@@ -207,8 +237,7 @@ def normalize_datetime(datetime_phrase: str, user_request: str) -> str | None:
 def format_api_datetime(datetime_value: str) -> str:
     """
     Ophelia availability expects an ISO timestamp with a Z suffix.
-    The MVP stores local wall time as YYYY-MM-DDTHH:MM:SS, so format it
-    consistently for the REST payload without changing the selected time.
+    So this function will basically help me to append it.
     """
     value = (datetime_value or "").strip()
     if not value:
@@ -223,7 +252,7 @@ def format_api_datetime(datetime_value: str) -> str:
 def parse_desired_location(location_phrase: str, user_request: str = "") -> tuple[str, str]:
     """
     This function will help match natural-language location text against the user's predefined
-    desired locations. Returns (search_location, desired_location_key).
+    desired locations. Returns (search_location, desired_location_key), which is stored as constants for now.
     """
     source = f"{location_phrase or ''} {user_request or ''}".lower()
     source = re.sub(r"\s+", " ", source).strip()
@@ -239,13 +268,74 @@ def parse_desired_location(location_phrase: str, user_request: str = "") -> tupl
                 alias_candidates.append((len(alias_lower), location))
 
     if not alias_candidates:
-        return "", ""
+        explicit_location = extract_explicit_city_state(location_phrase)
+        return (explicit_location, "") if explicit_location else ("", "")
 
     _, selected = max(alias_candidates, key=lambda item: item[0])
     return selected["search_location"], selected["key"]
 
 
+def title_city_state(location: str) -> str:
+    parts = [part.strip() for part in location.split(",", 1)]
+    if len(parts) != 2:
+        return location.strip()
+    city, state = parts
+    return f"{city.title()}, {state.upper()}"
+
+
+def extract_explicit_city_state(text: str) -> str:
+    """
+    Extract a scalable custom city/state location, e.g. "New Haven, CT".
+
+    The predefined DESIRED_LOCATIONS list is useful for the MVP demo, but partners
+    can also pass a clear city/state that is not in that list. In that case, we
+    should use the explicit user-provided location instead of forcing clarification.
+    """
+    source = (text or "").strip()
+    match = re.search(r"\b([A-Za-z][A-Za-z .'-]+,\s*[A-Za-z]{2})\b", source)
+    if not match:
+        return ""
+    return title_city_state(match.group(1))
+
+
+def split_named_place_and_location(
+    *,
+    term: str,
+    raw_location: str,
+    user_request: str,
+) -> tuple[str, str]:
+    """
+    Handles cases like:
+
+      "book a table at South Bay in New Haven, CT"
+
+    The LLM sometimes puts "South Bay in New Haven, CT" into location and leaves
+    term empty. Ophelia wants term="South Bay" and location="New Haven, CT".
+    """
+    sources = [user_request or "", raw_location or ""]
+    patterns = [
+        r"\bat\s+(?P<place>.+?)\s+(?:in|near)\s+(?P<location>[A-Za-z][A-Za-z .'-]+,\s*[A-Za-z]{2})\b",
+        r"^(?P<place>.+?)\s+(?:in|near)\s+(?P<location>[A-Za-z][A-Za-z .'-]+,\s*[A-Za-z]{2})\b",
+    ]
+    for source in sources:
+        normalized = re.sub(r"\s+", " ", source).strip()
+        for pattern in patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if not match:
+                continue
+            inferred_term = (term or match.group("place")).strip(" .,:;")
+            inferred_location = title_city_state(match.group("location"))
+            return inferred_term.title(), inferred_location
+
+    explicit_location = extract_explicit_city_state(raw_location) or extract_explicit_city_state(user_request)
+    return term, explicit_location
+
+
 def location_from_answer(answer: Any, fallback_location: str = "", fallback_key: str = "") -> tuple[str, str]:
+    '''
+    now this function helps me to extract location when the user hasn't mentioned it clearly in their request
+    and the clarify node fires to ask them extra details and location is one of them.
+    '''
     raw = str(answer or "").strip()
     if not raw:
         return fallback_location, fallback_key
@@ -263,14 +353,311 @@ def location_from_answer(answer: Any, fallback_location: str = "", fallback_key:
     return raw, ""
 
 
+def vertical_policy(vertical: str | None) -> dict[str, Any]:
+    return VERTICAL_POLICIES.get((vertical or "dining").lower(), VERTICAL_POLICIES["dining"])
+
+
+'''
+now as there are minor changes when it comes to building payloads for verticals,
+I have used VERTICAL_POLICIES, which is a dictionary that stores some context on how to build 
+request payloads for the respective verticals
+'''
+
 def required_missing(state: BookingState) -> list[str]:
     missing: list[str] = []
-    for field in ("term", "location", "booking_datetime", "party_size"):
+    policy = vertical_policy(state.get("vertical"))
+    for field in policy["required_fields"]:
         if not state.get(field):
             missing.append(field)
+    if state.get("booking_datetime") and "datetime" not in missing and not has_explicit_time(state):
+        missing.append("datetime")
+    if (
+        state.get("vertical") == "dining"
+        and state.get("term")
+        and is_vague_dining_term(str(state.get("term")))
+        and dining_preference_cuisines(state)
+        and "term" not in missing
+    ):
+        missing.append("term")
     return missing
 
 
+def build_search_payload(state: BookingState) -> dict[str, Any]:
+    vertical = (state.get("vertical") or "dining").lower()
+    policy = vertical_policy(vertical)
+    party_size = state.get("party_size") or policy.get("default_party_size")
+    payload: dict[str, Any] = {
+        "vertical": vertical,
+        "term": state["term"],
+        "location": state["location"],
+        "datetime": state["booking_datetime"],
+    }
+    if party_size and policy.get("include_party_size_in_search"):
+        payload["party_size"] = int(party_size)
+    return payload
+
+
+def has_explicit_time(state: BookingState) -> bool:
+    source = f"{state.get('datetime_phrase') or ''} {state.get('user_request') or ''}".lower()
+    time_patterns = [
+        r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b",
+        r"\b\d{1,2}:\d{2}\b",
+        r"\b(noon|midnight)\b",
+    ]
+    return any(re.search(pattern, source) for pattern in time_patterns)
+
+
+def is_vague_dining_term(term: str) -> bool:
+    normalized = re.sub(r"[^a-z\s]", "", (term or "").lower()).strip()
+    vague_terms = {
+        "birthday dinner",
+        "dinner",
+        "birthday",
+        "restaurant",
+        "place",
+        "meal",
+        "food",
+        "date night",
+        "celebration",
+    }
+    return normalized in vague_terms or normalized.endswith(" dinner") and normalized.split()[0] in {"birthday", "anniversary", "celebration"}
+
+
+def profile_party_size(profile: dict[str, Any]) -> int | None:
+    if not isinstance(profile, dict):
+        return None
+    total = 1
+    relationship = str(profile.get("relationship_status") or "").lower()
+    if relationship in {"married", "partnered"}:
+        total += 1
+    kids = profile.get("kids") if isinstance(profile.get("kids"), dict) else {}
+    if kids.get("has_kids"):
+        try:
+            total += int(kids.get("count") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total if total > 1 else None
+
+
+def dining_preference_cuisines(state: BookingState) -> list[str]:
+    cuisines: list[str] = []
+    preferences = state.get("preferences") if isinstance(state.get("preferences"), dict) else {}
+    for source in (
+        preferences.get("cuisines"),
+        preferences.get("dining", {}).get("cuisines") if isinstance(preferences.get("dining"), dict) else None,
+        state.get("user_profile", {}).get("preferences", {}).get("dining", {}).get("cuisines")
+        if isinstance(state.get("user_profile"), dict)
+        else None,
+    ):
+        if isinstance(source, list):
+            for cuisine in source:
+                cuisine_text = str(cuisine).strip()
+                if cuisine_text and cuisine_text not in cuisines:
+                    cuisines.append(cuisine_text)
+    return cuisines
+
+
+def dining_preference_neighborhoods(state: BookingState) -> list[str]:
+    neighborhoods: list[str] = []
+    preferences = state.get("preferences") if isinstance(state.get("preferences"), dict) else {}
+    for source in (
+        preferences.get("neighborhoods"),
+        preferences.get("dining", {}).get("neighborhoods") if isinstance(preferences.get("dining"), dict) else None,
+        state.get("user_profile", {}).get("preferences", {}).get("dining", {}).get("neighborhoods")
+        if isinstance(state.get("user_profile"), dict)
+        else None,
+    ):
+        if isinstance(source, list):
+            for neighborhood in source:
+                neighborhood_text = str(neighborhood).strip()
+                if neighborhood_text and neighborhood_text not in neighborhoods:
+                    neighborhoods.append(neighborhood_text)
+    return neighborhoods
+
+
+def term_from_answer(answer: Any, state: BookingState) -> str:
+    raw = str(answer or "").strip()
+    if raw.isdigit():
+        cuisines = dining_preference_cuisines(state)
+        idx = int(raw) - 1
+        if 0 <= idx < len(cuisines):
+            return cuisines[idx]
+    return raw
+
+
+def payment_payload_from_details(details: dict[str, Any], include_full_billing_address: bool = False) -> dict[str, Any]:
+    payment = {
+        "card_number": details.get("card_number"),
+        "exp_month": details.get("card_exp_month"),
+        "exp_year": details.get("card_exp_year"),
+        "cvv": details.get("card_cvv"),
+        "name_on_card": details.get("card_name"),
+        "postal_code": details.get("card_postal"),
+    }
+    if include_full_billing_address:
+        payment["address_line1"] = details.get("billing_address_line1")
+        payment["city"] = details.get("billing_city")
+        payment["state"] = details.get("billing_state")
+        payment["country"] = details.get("billing_country") or "US"
+    return payment
+
+
+def payment_fields_for_policy(policy: dict[str, Any]) -> list[str]:
+    fields = ["card_number", "card_exp_month", "card_exp_year", "card_cvv", "card_name", "card_postal"]
+    if policy.get("needs_full_billing_address"):
+        fields.extend(["billing_address_line1", "billing_city", "billing_state", "billing_country"])
+    return fields
+
+
+'''
+now this is to help with context for queries like: "Book me birthday dinner".
+
+This will help store booking details (this is actually helpful for the hallucination usecase)
+'''
+
+def booking_memory_content(state: BookingState) -> str:
+    vertical = state.get("vertical") or "dining"
+    venue = state.get("selected_venue", {})
+    venue_name = venue.get("name") or "selected result"
+    term = state.get("term") or vertical
+    location = state.get("location") or "unknown location"
+    status = state.get("booking_status") or "unknown"
+    if vertical == "fitness":
+        class_time = venue.get("metadata", {}).get("class_time") if isinstance(venue.get("metadata"), dict) else ""
+        time_note = f" at {class_time}" if class_time else ""
+        return f"User attempted {term} fitness booking at {venue_name}{time_note} near {location}; final status {status}."
+    return f"User attempted {term} dining booking at {venue_name} near {location}; final status {status}."
+
+
+def extract_profile_update_from_state(state: BookingState) -> dict[str, Any]:
+    user_request = (state.get("user_request") or "").lower()
+    update: dict[str, Any] = {}
+
+    if re.search(r"\b(my )?(wife|husband|spouse|partner)\b", user_request):
+        update["relationship_status"] = "married" if re.search(r"\b(wife|husband|spouse)\b", user_request) else "partnered"
+
+    kids_count = extract_kids_count(user_request)
+    if kids_count is not None:
+        update["kids"] = {"has_kids": kids_count > 0, "count": kids_count}
+
+    pet_types = extract_pet_types(user_request)
+    if pet_types:
+        update["pets"] = {"has_pets": True, "types": pet_types}
+
+    vertical = state.get("vertical")
+    preferences: dict[str, Any] = {}
+    term = state.get("term")
+    if vertical == "dining":
+        cuisines = dining_preference_cuisines(state)
+        if term and not is_vague_dining_term(str(term)):
+            cuisines.append(str(term))
+        for cuisine in cuisines:
+            cuisine_text = str(cuisine).strip()
+            if cuisine_text:
+                preferences.setdefault("dining", {}).setdefault("cuisines", []).append(cuisine_text)
+    if vertical == "fitness" and term:
+        preferences.setdefault("fitness", {}).setdefault("activities", []).append(term)
+
+    location_label = location_label_from_key(state.get("desired_location_key"))
+    if vertical == "dining" and location_label:
+        preferences.setdefault("dining", {}).setdefault("neighborhoods", []).append(location_label)
+    if vertical == "dining":
+        for neighborhood in dining_preference_neighborhoods(state):
+            preferences.setdefault("dining", {}).setdefault("neighborhoods", []).append(neighborhood)
+
+    if preferences:
+        update["preferences"] = preferences
+
+    return update
+
+
+def extract_kids_count(text: str) -> int | None:
+    number_words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+    }
+    match = re.search(r"\b(\d+|one|two|three|four|five|six)\s+(kids?|children)\b", text)
+    if match:
+        raw = match.group(1)
+        return int(raw) if raw.isdigit() else number_words.get(raw)
+    if re.search(r"\b(my )?(kid|kids|child|children)\b", text):
+        return 1
+    return None
+
+
+def extract_pet_types(text: str) -> list[str]:
+    pet_types: list[str] = []
+    for pet in ("dog", "cat", "bird", "rabbit"):
+        if re.search(rf"\b{pet}s?\b", text):
+            pet_types.append(pet)
+    if not pet_types and re.search(r"\bpet\b", text):
+        pet_types.append("pet")
+    return pet_types
+
+
+def location_label_from_key(location_key: str | None) -> str:
+    if not location_key:
+        return ""
+    for location in DESIRED_LOCATIONS:
+        if location["key"] == location_key:
+            return str(location["label"])
+    return ""
+
+
+def summary_booking_details(state: BookingState) -> str:
+    policy = vertical_policy(state.get("vertical"))
+    selected = state.get("selected_venue", {}) or {}
+    metadata = selected.get("metadata") if isinstance(selected.get("metadata"), dict) else {}
+    provider = selected_provider(state)
+
+    lines = ["Booking Details:"]
+    lines.append(f"- Vertical: {state.get('vertical') or 'dining'}")
+    lines.append(f"- {policy['result_label']}: {selected.get('name') or 'Unknown result'}")
+    studio_name = metadata.get("studio_name")
+    if studio_name:
+        lines.append(f"- Studio/Venue: {studio_name}")
+    address = ", ".join(
+        str(selected.get(key, "")).strip()
+        for key in ("address", "city", "state")
+        if selected.get(key)
+    )
+    if address:
+        lines.append(f"- Address: {address}")
+    if provider:
+        lines.append(f"- Provider: {provider}")
+    if state.get("customer_name"):
+        lines.append(f"- Guest Name: {state['customer_name']}")
+    if state.get("booking_datetime"):
+        lines.append(f"- Reserved Date & Time: {state['booking_datetime']}")
+    if state.get("party_size") and policy.get("include_party_size_in_booking"):
+        lines.append(f"- Party Size: {state['party_size']}")
+
+    for label, key in (
+        ("Class Time", "class_time"),
+        ("Class Date", "date"),
+        ("Price", "price"),
+        ("Category", "category"),
+        ("Distance", "distance"),
+    ):
+        value = metadata.get(key)
+        if value:
+            lines.append(f"- {label}: {value}")
+
+    if state.get("booking_id"):
+        lines.append(f"- Booking ID: {state['booking_id']}")
+    lines.append(f"- Final status: {state.get('booking_status', 'unknown')}")
+    return "\n".join(lines) + "\n"
+
+
+
+'''
+this is for showing user a list of venues to choose from (for now I am only showing a max of 5, kinda helps 
+with choice paralysis)
+'''
 def venue_display(venue: dict[str, Any]) -> str:
     address = ", ".join(
         str(venue.get(key, "")).strip()
@@ -278,7 +665,15 @@ def venue_display(venue: dict[str, Any]) -> str:
         if venue.get(key)
     )
     provider = venue.get("provider") or venue.get("source") or "unknown provider"
-    return f"{venue.get('name', 'Unknown venue')} ({venue.get('id')}) — {address} [{provider}]"
+    metadata = venue.get("metadata") if isinstance(venue.get("metadata"), dict) else {}
+    class_time = metadata.get("class_time")
+    price = metadata.get("price") or venue.get("price")
+    extra = ""
+    if class_time:
+        extra += f" — {class_time}"
+    if price:
+        extra += f" — {price}"
+    return f"{venue.get('name', 'Unknown venue')} ({venue.get('id')}) — {address}{extra} [{provider}]"
 
 
 def selected_provider(state: BookingState) -> str:
@@ -288,6 +683,10 @@ def selected_provider(state: BookingState) -> str:
         or ""
     ).strip().lower()
 
+
+''' 
+this is for processing purposes in the availablity node.
+'''
 
 def requested_time_label(booking_datetime: str) -> str:
     try:
@@ -362,33 +761,60 @@ def public_status_from_booking_response(response: dict[str, Any]) -> str:
     return status
 
 
+
 async def main() -> None:
     api = OpheliaAPIClient.from_env()
+    memory_store = MemoryStore.from_env()
+    default_org_id = os.getenv("OPHELIA_ORG_ID", "demo_org")
+    default_user_id = os.getenv("OPHELIA_USER_ID", "demo_user")
     model = ChatGroq(model_name=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+
+    def load_user_context_node(state: BookingState) -> dict[str, Any]:
+        org_id = state.get("org_id") or default_org_id
+        user_id = state.get("user_id") or default_user_id
+        vertical = state.get("vertical") or None
+        logger.info("load_user_context_node: loading memory for org_id=%s user_id=%s", org_id, user_id)
+        memory_store.ensure_user(org_id=org_id, user_id=user_id)
+        profile = memory_store.get_profile(org_id=org_id, user_id=user_id)
+        events = memory_store.recent_memory_events(org_id=org_id, user_id=user_id, vertical=vertical)
+        return {
+            "org_id": org_id,
+            "user_id": user_id,
+            "user_profile": profile,
+            "memory_events": events,
+            "memory_context": build_memory_context(profile, events),
+        }
 
     async def extract_intent_node(state: BookingState) -> dict[str, Any]:
         logger.info("extract_intent_node: parsing user request")
         user_request = state.get("user_request", "")
+        memory_context = state.get("memory_context", "No user memory available yet.")
         prompt = f"""
-You extract booking intent for the Ophelia API.
+                You extract booking intent for the Ophelia API.
 
-Return ONLY valid JSON with these keys:
-- vertical: "dining", "fitness", or "entertainment"
-- term: restaurant/cuisine/activity/event search term
-- location: city/neighborhood/state/country text
-- datetime_phrase: exact natural language date/time phrase from the user, e.g. "today at 7pm"
-- party_size: integer number of people/tickets when present, otherwise null
-- preferences: object of soft preferences
-- missing_fields: array of missing required fields for a dining booking
+                Return ONLY valid JSON with these keys:
+                - vertical: "dining" or "fitness"
+                - term: restaurant/cuisine/activity/event search term
+                - location: city/neighborhood/state/country text
+                - datetime_phrase: exact natural language date/time phrase from the user, e.g. "today at 7pm"
+                - party_size: integer number of people/tickets when present, otherwise null
+                - preferences: object of soft preferences
+                - missing_fields: array of missing required fields for the selected vertical
 
-Rules:
-- MVP supports dining only, but still classify the vertical.
-- Do not invent missing values.
-- For "Italian place in SoHo" term is "Italian" and location is "SoHo".
-- Keep datetime_phrase as natural language; do not normalize it.
+                Rules:
+                - MVP supports dining and fitness.
+                - Do not invent missing values.
+                - For "Italian place in SoHo" term is "Italian" and location is "SoHo".
+                - For "table at South Bay in New Haven, CT" term is "South Bay" and location is "New Haven, CT".
+                - For "pilates class near SoHo" vertical is "fitness" and term is "pilates".
+                - Keep datetime_phrase as natural language; do not normalize it.
+                - Use user memory only to refine soft preferences. Do not invent booking-critical fields.
 
-User request: {user_request}
-""".strip()
+                Safe user memory:
+                {memory_context}
+
+                User request: {user_request}
+                """.strip()
 
         last_error: Exception | None = None
         parsed: dict[str, Any] = {}
@@ -404,11 +830,23 @@ User request: {user_request}
             logger.warning("extract_intent_node: falling back to clarification after parse failure: %s", last_error)
             return {"missing_fields": ["term", "location", "datetime", "party_size"]}
 
-        vertical = parsed.get("vertical") or "dining"
+        vertical = (parsed.get("vertical") or "dining").lower()
+
+        # I'm doing this temporarily for the MVP, but I'll have proper vertical support in the future
+        # if vertical not in VERTICAL_POLICIES:
+        #     vertical = "dining"
         datetime_phrase = parsed.get("datetime_phrase") or ""
         booking_datetime = normalize_datetime(datetime_phrase, user_request)
         raw_location = parsed.get("location") or ""
-        location, desired_location_key = parse_desired_location(raw_location, user_request)
+        term = parsed.get("term") or ""
+        term, inferred_custom_location = split_named_place_and_location(
+            term=term,
+            raw_location=raw_location,
+            user_request=user_request,
+        )
+        location, desired_location_key = parse_desired_location(inferred_custom_location or raw_location, user_request)
+        if inferred_custom_location and not desired_location_key:
+            location = inferred_custom_location
         party_size = parsed.get("party_size")
         try:
             party_size = int(party_size) if party_size is not None else None
@@ -417,7 +855,7 @@ User request: {user_request}
 
         update: BookingState = {
             "vertical": vertical,
-            "term": parsed.get("term") or "",
+            "term": term,
             "raw_location": raw_location,
             "desired_location_key": desired_location_key,
             "location": location,
@@ -436,19 +874,62 @@ User request: {user_request}
             "next_action": {},
             "error": {},
             "poll_attempts": 0,
+            "memory_recorded": False,
+            "profile_update_recorded": False,
         }
         if booking_datetime:
             update["booking_datetime"] = booking_datetime
         if party_size:
             update["party_size"] = party_size
+        elif vertical_policy(vertical).get("default_party_size"):
+            update["party_size"] = int(vertical_policy(vertical)["default_party_size"])
 
+        # if i have any missing values this where I call required_missing to
+        # figure out the missing values for that particular vertical and then send
+        # control to clarify node to do the needful
         update["missing_fields"] = required_missing(update)
         logger.info("extract_intent_node: extracted intent=%s", redact(update))
         return update
 
+    def update_user_profile_node(state: BookingState) -> dict[str, Any]:
+        if state.get("profile_update_recorded"):
+            return {}
+
+        profile_update = extract_profile_update_from_state(state)
+        if not profile_update:
+            return {}
+
+        org_id = state.get("org_id") or default_org_id
+        user_id = state.get("user_id") or default_user_id
+        logger.info("update_user_profile_node: merging profile update=%s", redact(profile_update))
+        try:
+            profile = memory_store.merge_profile_update(org_id=org_id, user_id=user_id, update=profile_update)
+            memory_store.add_memory_event(
+                org_id=org_id,
+                user_id=user_id,
+                vertical=state.get("vertical"),
+                source="user_request",
+                memory_type="profile_update",
+                content="User shared non-sensitive profile/preferences during a booking request.",
+                metadata=profile_update,
+                confidence=0.85,
+            )
+            events = memory_store.recent_memory_events(org_id=org_id, user_id=user_id, vertical=state.get("vertical"))
+            return {
+                "user_profile": profile,
+                "memory_events": events,
+                "memory_context": build_memory_context(profile, events),
+                "profile_update_recorded": True,
+            }
+        except Exception as exc:
+            logger.warning("update_user_profile_node: failed to update profile: %s", exc)
+            return {}
+
     def clarify_node(state: BookingState) -> dict[str, Any]:
         missing = required_missing(state)
         logger.info("clarify_node: missing fields=%s", missing)
+        cuisine_choices = dining_preference_cuisines(state) if "term" in missing else []
+        suggested_party_size = profile_party_size(state.get("user_profile", {})) if "party_size" in missing else None
         answers = interrupt(
             {
                 "message": "I need a few details before searching.",
@@ -462,11 +943,21 @@ User request: {user_request}
                     "party_size": state.get("party_size"),
                 },
                 "location_choices": LOCATION_CHOICES,
+                "term_choices": [
+                    f"{idx}. {cuisine}" for idx, cuisine in enumerate(cuisine_choices, start=1)
+                ],
+                "field_suggestions": {
+                    "term": "I remember you like: " + ", ".join(cuisine_choices) if cuisine_choices else "",
+                    "party_size": f"Based on your profile, this may be for {suggested_party_size} people. Confirm or enter another number."
+                    if suggested_party_size
+                    else "",
+                    "datetime": "Please include both date and time, e.g. 'tomorrow at 7 PM'.",
+                },
             }
         )
 
         user_request = state.get("user_request", "")
-        term = answers.get("term") or state.get("term", "")
+        term = term_from_answer(answers.get("term"), state) or state.get("term", "")
         raw_location = answers.get("location") or answers.get("raw_location") or state.get("raw_location", "")
         location, desired_location_key = location_from_answer(
             raw_location,
@@ -496,6 +987,10 @@ User request: {user_request}
         update["missing_fields"] = required_missing(update | {k: v for k, v in state.items() if k not in update})
         return update
 
+
+    '''
+    these are function for conditional edges of the graph
+    '''
     def route_after_intent(state: BookingState) -> Literal["clarify", "search"]:
         return "clarify" if required_missing(state) else "search"
 
@@ -506,13 +1001,7 @@ User request: {user_request}
         return "summary" if state.get("booking_status") in TERMINAL_STATUSES else "preflight_and_consent"
 
     async def search_node(state: BookingState) -> dict[str, Any]:
-        payload = {
-            "vertical": "dining",
-            "term": state["term"],
-            "location": state["location"],
-            "datetime": state["booking_datetime"],
-            "party_size": int(state["party_size"]),
-        }
+        payload = build_search_payload(state)
         logger.info("search_node: payload=%s", redact(payload))
         try:
             response = await api.search_venues(payload)
@@ -564,7 +1053,22 @@ User request: {user_request}
                 "error": {"category": "validation", "message": "No selected venue ID found."},
             }
 
-        if selected_provider(state) == "opentable":
+        provider = selected_provider(state)
+        if provider == "mindbody":
+            selected_venue = state.get("selected_venue", {})
+            metadata = selected_venue.get("metadata") if isinstance(selected_venue.get("metadata"), dict) else {}
+            class_time = metadata.get("class_time")
+            logger.info("availability_node: using Mindbody inline class metadata class_time=%s", class_time)
+            return {
+                "availability": {
+                    "source": "venues/search.inline",
+                    "provider": "mindbody",
+                    "class_time": class_time,
+                    "available": True,
+                }
+            }
+
+        if provider == "opentable":
             selected_venue = state.get("selected_venue", {})
             inline_times = selected_venue.get("available_times") or []
             requested_time = requested_time_label(state.get("booking_datetime", ""))
@@ -599,11 +1103,13 @@ User request: {user_request}
 
         payload = {
             "venue_id": venue_id,
-            "party_size": int(state["party_size"]),
+            "party_size": int(state.get("party_size") or vertical_policy(state.get("vertical")).get("default_party_size") or 1),
             "datetime": format_api_datetime(state["booking_datetime"]),
             "window_minutes": 60,
         }
         logger.info("availability_node: payload=%s", redact(payload))
+
+        # I am have this for a graceful fallback if neither of the above works
         try:
             response = await api.search_availability(payload)
         except OpheliaAPIError as exc:
@@ -616,13 +1122,15 @@ User request: {user_request}
 
     def preflight_and_consent_node(state: BookingState) -> dict[str, Any]:
         venue = state.get("selected_venue", {})
+        policy = vertical_policy(state.get("vertical"))
         consent = interrupt(
             {
                 "message": "Please confirm before I create a real booking.",
                 "booking_details": {
-                    "venue": venue_display(venue),
+                    policy["label"]: venue_display(venue),
                     "datetime": state.get("booking_datetime"),
                     "party_size": state.get("party_size"),
+                    "vertical": state.get("vertical", "dining"),
                 },
                 "fields_needed": ["approved"],
             }
@@ -641,6 +1149,10 @@ User request: {user_request}
 
     async def create_booking_node(state: BookingState) -> dict[str, Any]:
         venue_id = state.get("selected_venue_id") or "unknown"
+        vertical = (state.get("vertical") or "dining").lower()
+        policy = vertical_policy(vertical)
+
+        # this my solution for akamai blocks using Redis can_book and get_cool_off_period
         if not can_book(venue_id):
             logger.warning("create_booking_node: rate limit exceeded for venue %s", venue_id)
             return {
@@ -657,19 +1169,24 @@ User request: {user_request}
             print(f"\n[Cooldown] Waiting {wait_time} seconds before trying this provider again...")
             await asyncio.sleep(wait_time)
 
+            
+
+        fields_needed = ["name", "email", "phone", *payment_fields_for_policy(policy)]
+        if policy.get("needs_password"):
+            fields_needed.append("password")
+
         details = interrupt(
             {
                 "message": "Please provide the customer details for this booking request.",
-                "fields_needed": ["name", "email", "phone", "card_number", "card_exp_month", "card_exp_year", "card_cvv", "card_name", "card_postal"],
+                "fields_needed": fields_needed,
             }
         )
 
         idempotency_key = state.get("idempotency_key") or str(uuid.uuid4())
         payload: dict[str, Any] = {
-            "vertical": "dining",
+            "vertical": vertical,
             "venue_id": venue_id,
             "datetime": state["booking_datetime"],
-            "party_size": int(state["party_size"]),
             "customer": {
                 "name": details["name"],
                 "email": details["email"],
@@ -677,15 +1194,15 @@ User request: {user_request}
             },
             "metadata": {},
         }
+        if policy.get("include_party_size_in_booking"):
+            payload["party_size"] = int(state.get("party_size") or policy.get("default_party_size") or 1)
         if details.get("card_number"):
-            payload["metadata"]["payment"] = {
-                "card_number": details.get("card_number"),
-                "exp_month": details.get("card_exp_month"),
-                "exp_year": details.get("card_exp_year"),
-                "cvv": details.get("card_cvv"),
-                "name_on_card": details.get("card_name"),
-                "postal_code": details.get("card_postal"),
-            }
+            payload["metadata"]["payment"] = payment_payload_from_details(
+                details,
+                include_full_billing_address=bool(policy.get("needs_full_billing_address")),
+            )
+        if policy.get("needs_password"):
+            payload["metadata"]["password"] = details.get("password")
 
         logger.info("create_booking_node: creating booking payload=%s idempotency_key=%s", redact(payload), idempotency_key)
         try:
@@ -830,23 +1347,16 @@ User request: {user_request}
             return {"booking_status": "error", "error": {"category": "validation", "message": "Missing booking ID for continuation."}}
 
         if action_type == "payment":
+            policy = vertical_policy(state.get("vertical"))
+            fields_needed = payment_fields_for_policy(policy)
             prompt = {
                 "message": f"Booking {booking_id} requires payment details.",
                 "booking_id": booking_id,
                 "next_action": next_action,
-                "fields_needed": ["card_number", "card_exp_month", "card_exp_year", "card_cvv", "card_name", "card_postal"],
+                "fields_needed": fields_needed,
             }
             payment = interrupt(prompt)
-            payload = {
-                "payment": {
-                    "card_number": payment.get("card_number"),
-                    "exp_month": payment.get("card_exp_month"),
-                    "exp_year": payment.get("card_exp_year"),
-                    "cvv": payment.get("card_cvv"),
-                    "name_on_card": payment.get("card_name"),
-                    "postal_code": payment.get("card_postal"),
-                }
-            }
+            payload = {"payment": payment_payload_from_details(payment, bool(policy.get("needs_full_billing_address")))}
         else:
             otp = interrupt(
                 {
@@ -872,44 +1382,73 @@ User request: {user_request}
     async def summary_node(state: BookingState) -> dict[str, Any]:
         status = state.get("booking_status", "unknown")
         succeeded = status == "confirmed"
-        venue_name = state.get("selected_venue", {}).get("name") or "Unknown venue"
-        booking_details = (
-            "Booking Details:\n"
-            f"- Restaurant Search Result: {venue_name}\n"
-            f"- Guest Name: {state.get('customer_name') or 'Not provided'}\n"
-            f"- Reserved Date & Time: {state.get('booking_datetime')}\n"
-            f"- Party Size: {state.get('party_size')}\n"
-            f"- Booking ID: {state.get('booking_id')}\n"
-            f"- Final status: {status}\n"
-        )
+        selected = state.get("selected_venue", {}) or {}
+        venue_name = selected.get("name") or "Unknown result"
+        selected_metadata = selected.get("metadata") if isinstance(selected.get("metadata"), dict) else {}
+        booking_details = summary_booking_details(state)
         grounded = {
+            "vertical": state.get("vertical") or "dining",
             "status": status,
             "booking_id": state.get("booking_id"),
-            "venue": venue_name,
+            "selected_result": {
+                "id": state.get("selected_venue_id"),
+                "name": venue_name,
+                "provider": selected_provider(state),
+                "metadata": selected_metadata,
+            },
             "datetime": state.get("booking_datetime"),
-            "party_size": state.get("party_size"),
+            "party_size": state.get("party_size") if vertical_policy(state.get("vertical")).get("include_party_size_in_booking") else None,
             "error": state.get("error"),
             "booking_response": redact(state.get("booking_response", {})),
         }
         prompt = f"""
-Write a short user-facing booking result.
-Use only the grounded JSON. Do not imply success unless status is confirmed.
-If status is verification_required, explicitly say the booking could not be verified as confirmed yet.
-If failed/error/rate_limited/expired, be honest and include the sanitized error code if present.
-Please ensure you replace any bracketed placeholders like [Insert Date], [Insert Time],
-[Guest], [Insert Party Size], or [Guest Name] with the actual details provided below.
-Do not invent a guest name; use the guest name from Booking Details only if present.
+                    Write a short user-facing booking result.
+                    Use only the grounded JSON. Do not imply success unless status is confirmed.
+                    If status is verification_required, explicitly say the booking could not be verified as confirmed yet.
+                    If failed/error/rate_limited/expired, be honest and include the sanitized error code if present.
+                    Use the selected_result and Booking Details keys that are present.
+                    Do not mention missing fields, and do not invent a guest name, party size, class time, venue, or confirmation code.
 
-{booking_details}
+                    {booking_details}
 
-Grounded JSON:
-{json.dumps(grounded, indent=2)}
-""".strip()
+                    Grounded JSON:
+                    {json.dumps(grounded, indent=2)}
+                    """.strip()
         resp = await model.ainvoke([("user", prompt)])
         print("\n" + "=" * 60)
         print(resp.content)
         print("=" * 60 + "\n")
-        return {"final_summary": resp.content, "booking_succeeded": succeeded}
+        update: BookingState = {"final_summary": resp.content, "booking_succeeded": succeeded}
+
+        if state.get("booking_id") and not state.get("memory_recorded"):
+            metadata = {
+                "booking_id": state.get("booking_id"),
+                "status": status,
+                "provider": selected_provider(state),
+                "term": state.get("term"),
+                "venue_id": state.get("selected_venue_id"),
+                "venue_name": venue_name,
+                "location": state.get("location"),
+                "datetime": state.get("booking_datetime"),
+                "party_size": state.get("party_size"),
+                "error_code": booking_error_code(state.get("booking_response", {})),
+            }
+            try:
+                memory_store.add_memory_event(
+                    org_id=state.get("org_id") or default_org_id,
+                    user_id=state.get("user_id") or default_user_id,
+                    vertical=state.get("vertical") or "dining",
+                    source="booking_result",
+                    memory_type="booking_history",
+                    content=booking_memory_content(state),
+                    metadata=metadata,
+                )
+                update["memory_recorded"] = True
+                logger.info("summary_node: wrote booking memory event metadata=%s", redact(metadata))
+            except Exception as exc:
+                logger.warning("summary_node: failed to write memory event: %s", exc)
+
+        return update
 
     def waiting_node(state: BookingState) -> dict[str, Any]:
         user_input = interrupt(
@@ -946,7 +1485,9 @@ Grounded JSON:
         }
 
     workflow = StateGraph(BookingState)
+    workflow.add_node("load_user_context", load_user_context_node)
     workflow.add_node("extract_intent", extract_intent_node)
+    workflow.add_node("update_user_profile", update_user_profile_node)
     workflow.add_node("clarify", clarify_node)
     workflow.add_node("search", search_node)
     workflow.add_node("select_venue", select_venue_node)
@@ -959,9 +1500,11 @@ Grounded JSON:
     workflow.add_node("wait_for_user", waiting_node)
     workflow.add_node("cancel", cancel_node)
 
-    workflow.add_edge(START, "extract_intent")
-    workflow.add_conditional_edges("extract_intent", route_after_intent, {"clarify": "clarify", "search": "search"})
-    workflow.add_conditional_edges("clarify", route_after_intent, {"clarify": "clarify", "search": "search"})
+    workflow.add_edge(START, "load_user_context")
+    workflow.add_edge("load_user_context", "extract_intent")
+    workflow.add_edge("extract_intent", "update_user_profile")
+    workflow.add_conditional_edges("update_user_profile", route_after_intent, {"clarify": "clarify", "search": "search"})
+    workflow.add_edge("clarify", "update_user_profile")
     workflow.add_conditional_edges("search", route_after_search, {"select_venue": "select_venue", "summary": "summary"})
     workflow.add_edge("select_venue", "availability")
     workflow.add_conditional_edges(
@@ -978,7 +1521,7 @@ Grounded JSON:
     workflow.add_conditional_edges(
         "wait_for_user",
         route_after_user_input,
-        {"cancel": "cancel", "new_booking": "extract_intent", "end": END},
+        {"cancel": "cancel", "new_booking": "load_user_context", "end": END},
     )
 
     app = workflow.compile(checkpointer=MemorySaver())
@@ -1020,11 +1563,6 @@ def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
         for choice in payload["choices"]:
             print(choice)
 
-    if payload.get("location_choices"):
-        print("\nLocation choices:")
-        for choice in payload["location_choices"]:
-            print(choice)
-
     if payload.get("booking_details"):
         print("\nBooking details:")
         for key, value in payload["booking_details"].items():
@@ -1038,20 +1576,50 @@ def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
         return {"message": input("> ").strip()}
 
     answers: dict[str, Any] = {}
-    for field in fields:
-        label = field.replace("_", " ").title()
+    field_suggestions = payload.get("field_suggestions") if isinstance(payload.get("field_suggestions"), dict) else {}
+
+    field_labels = {
+        "location": "location",
+        "term": "cuisine/activity",
+        "datetime": "date/time",
+        "party_size": "party size",
+        "selection": "venue selection",
+        "approved": "approval",
+        "otp_code": "OTP code",
+    }
+    if len(fields) > 1:
+        needed = ", ".join(field_labels.get(field, field.replace("_", " ")) for field in fields)
+        print(f"\nI'll ask for these one at a time: {needed}.")
+
+    for index, field in enumerate(fields, start=1):
+        label = field_labels.get(field, field.replace("_", " ").title())
+        if len(fields) > 1:
+            print(f"\n[{index}/{len(fields)}] {label.title()}")
+        suggestion = field_suggestions.get(field)
+        if suggestion:
+            print(suggestion)
         if field == "approved":
             answers[field] = input("Approve booking? Type yes/no: ").strip()
         elif field == "selection":
             answers[field] = input("Selection number: ").strip()
         elif field == "location":
+            if payload.get("location_choices"):
+                print("Location choices:")
+                for choice in payload["location_choices"]:
+                    print(choice)
             answers[field] = input("Location number or custom location: ").strip()
+        elif field == "term":
+            if payload.get("term_choices"):
+                print("Cuisine/activity choices:")
+                for choice in payload["term_choices"]:
+                    print(choice)
+            answers[field] = input("Cuisine/activity number or custom search term: ").strip()
         elif field == "card_cvv":
-            answers[field] = input(f"{label}: ").strip()
+            answers[field] = input(f"{label.title()}: ").strip()
         elif field == "otp_code":
             answers[field] = input("OTP code: ").strip()
         else:
-            answers[field] = input(f"{label}: ").strip()
+            answers[field] = input(f"{label.title()}: ").strip()
     return answers
 
 
