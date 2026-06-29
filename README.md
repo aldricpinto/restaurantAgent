@@ -12,12 +12,6 @@ The agent uses:
 
 ## 1. Setup
 
-From this folder:
-
-```bash
-cd /Users/aldricpinto/Projects/opheliaLLM
-```
-
 Install dependencies with `uv`:
 
 ```bash
