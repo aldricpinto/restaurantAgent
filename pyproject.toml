@@ -12,6 +12,7 @@ dependencies = [
     "langgraph>=1.2.2",
     "python-dotenv>=1.2.2",
     "redis>=5.0.0",
+    "sqlalchemy>=2.0.0",
 ]
 
 [tool.setuptools.packages.find]
