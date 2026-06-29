@@ -31,14 +31,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
 
 
 class MemoryStore:
-    """
-    SQLAlchemy-backed memory store for the MVP.
 
-    Uses a deliberately vertical-agnostic schema:
-    - users
-    - user_profiles with flexible profile_json
-    - user_memory_events with flexible metadata_json
-    """
 
     def __init__(self, database_url: str):
         self.database_url = database_url
@@ -140,27 +133,41 @@ class MemoryStore:
 
             rows = list(session.scalars(stmt))
 
-        events: list[dict[str, Any]] = []
-        for row in rows:
-            metadata: dict[str, Any] = {}
-            if row.metadata_json:
-                try:
-                    parsed = json.loads(row.metadata_json)
-                    metadata = parsed if isinstance(parsed, dict) else {}
-                except json.JSONDecodeError:
-                    metadata = {}
-            events.append(
-                {
-                    "vertical": row.vertical,
-                    "source": row.source,
-                    "memory_type": row.memory_type,
-                    "content": row.content,
-                    "metadata": metadata,
-                    "confidence": row.confidence,
-                    "created_at": row.created_at.isoformat() if row.created_at else "",
-                }
+        return [memory_event_to_dict(row) for row in rows]
+
+    def search_memory_events(
+        self,
+        *,
+        org_id: str,
+        user_id: str,
+        vertical: str | None = None,
+        memory_type: str | None = None,
+        query: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        with self.SessionLocal() as session:
+            stmt = (
+                select(UserMemoryEvent)
+                .where(UserMemoryEvent.org_id == org_id, UserMemoryEvent.user_id == user_id)
+                .order_by(UserMemoryEvent.created_at.desc(), UserMemoryEvent.id.desc())
+                .limit(limit)
             )
-        return events
+            if vertical:
+                stmt = stmt.where(or_(UserMemoryEvent.vertical == vertical, UserMemoryEvent.vertical.is_(None)))
+            if memory_type:
+                stmt = stmt.where(UserMemoryEvent.memory_type == memory_type)
+            if query:
+                pattern = f"%{query.strip()}%"
+                stmt = stmt.where(
+                    or_(
+                        UserMemoryEvent.content.ilike(pattern),
+                        UserMemoryEvent.metadata_json.ilike(pattern),
+                    )
+                )
+
+            rows = list(session.scalars(stmt))
+
+        return [memory_event_to_dict(row) for row in rows]
 
     def add_memory_event(
         self,
@@ -198,6 +205,25 @@ class MemoryStore:
         return session.scalar(
             select(UserProfile).where(UserProfile.org_id == org_id, UserProfile.user_id == user_id)
         )
+
+
+def memory_event_to_dict(row: UserMemoryEvent) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if row.metadata_json:
+        try:
+            parsed = json.loads(row.metadata_json)
+            metadata = parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            metadata = {}
+    return {
+        "vertical": row.vertical,
+        "source": row.source,
+        "memory_type": row.memory_type,
+        "content": row.content,
+        "metadata": metadata,
+        "confidence": row.confidence,
+        "created_at": row.created_at.isoformat() if row.created_at else "",
+    }
 
 
 def build_memory_context(profile: dict[str, Any], events: list[dict[str, Any]]) -> str:

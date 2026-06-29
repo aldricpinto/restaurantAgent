@@ -5,8 +5,8 @@ import os
 import re
 import sys
 import uuid
-from typing import Any, Literal, NotRequired
-
+from typing import Any, Literal
+from typing_extensions import TypedDict
 import dateparser
 import redis
 from dotenv import load_dotenv
@@ -14,8 +14,6 @@ from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
-from typing_extensions import TypedDict
-
 from memory_store import MemoryStore, build_memory_context
 from ophelia_client import OpheliaAPIClient, OpheliaAPIError, redact
 from utils.logger import agent_logger as logger
@@ -103,7 +101,10 @@ class BookingState(TypedDict, total=False):
     memory_context: str
     memory_recorded: bool
     profile_update_recorded: bool
+    last_memory_booking_event: dict[str, Any]
+    resolved_from_memory_reference: bool
     user_request: str
+    operation: str
     vertical: str
     term: str
     raw_location: str
@@ -137,7 +138,7 @@ class BookingState(TypedDict, total=False):
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 r = redis.from_url(redis_url)
 
-
+# these are redis solutions for rate limiting and cool down periods, to help with akamai blocks
 def can_book(venue_id: str, max_attempts: int = 3, time_window: int = 600) -> bool:
     if venue_id == "unknown":
         return True
@@ -195,11 +196,12 @@ def clear_failures(venue_id: str) -> None:
     except redis.exceptions.ConnectionError as e:
         logger.warning("Redis clear_failures unavailable for key %s: %s", key, e)
 
-
+# for logging purposes
 def now_iso() -> str:
     return dt.datetime.now().replace(microsecond=0).isoformat()
 
-
+# this is to parse LLM response even when it is explicitly asked to return JSON obj
+# a double check if LLM hallucinates
 def parse_json_object(text: str) -> dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
@@ -214,7 +216,8 @@ def parse_json_object(text: str) -> dict[str, Any]:
             raise
         return json.loads(match.group(0))
 
-
+# to manage messy human inputs for datetime,
+# eg: 'tomorrow 9PM'
 def normalize_datetime(datetime_phrase: str, user_request: str) -> str | None:
     phrase = (datetime_phrase or "").strip()
     if not phrase:
@@ -233,12 +236,12 @@ def normalize_datetime(datetime_phrase: str, user_request: str) -> str | None:
         return None
     return parsed.replace(microsecond=0).isoformat()
 
-
-def format_api_datetime(datetime_value: str) -> str:
-    """
+"""
     Ophelia availability expects an ISO timestamp with a Z suffix.
     So this function will basically help me to append it.
-    """
+"""
+def format_api_datetime(datetime_value: str) -> str:
+    
     value = (datetime_value or "").strip()
     if not value:
         return value
@@ -248,12 +251,12 @@ def format_api_datetime(datetime_value: str) -> str:
         return value
     return f"{value}Z"
 
-
-def parse_desired_location(location_phrase: str, user_request: str = "") -> tuple[str, str]:
-    """
+"""
     This function will help match natural-language location text against the user's predefined
-    desired locations. Returns (search_location, desired_location_key), which is stored as constants for now.
-    """
+    desired locations. Returns (search_location, desired_location_key). Used in the extract intent node.
+"""
+def parse_desired_location(location_phrase: str, user_request: str = "") -> tuple[str, str]:
+
     source = f"{location_phrase or ''} {user_request or ''}".lower()
     source = re.sub(r"\s+", " ", source).strip()
     if not source:
@@ -298,12 +301,6 @@ def extract_explicit_city_state(text: str) -> str:
     return title_city_state(match.group(1))
 
 
-def split_named_place_and_location(
-    *,
-    term: str,
-    raw_location: str,
-    user_request: str,
-) -> tuple[str, str]:
     """
     Handles cases like:
 
@@ -312,6 +309,15 @@ def split_named_place_and_location(
     The LLM sometimes puts "South Bay in New Haven, CT" into location and leaves
     term empty. Ophelia wants term="South Bay" and location="New Haven, CT".
     """
+
+
+def split_named_place_and_location(
+    *,
+    term: str,
+    raw_location: str,
+    user_request: str,
+) -> tuple[str, str]:
+
     sources = [user_request or "", raw_location or ""]
     patterns = [
         r"\bat\s+(?P<place>.+?)\s+(?:in|near)\s+(?P<location>[A-Za-z][A-Za-z .'-]+,\s*[A-Za-z]{2})\b",
@@ -331,11 +337,13 @@ def split_named_place_and_location(
     return term, explicit_location
 
 
+'''
+now this function helps me to extract location when the user hasn't mentioned it clearly in their request
+and the clarify node fires this function to ask them extra details and location is one of them.
+'''
+
 def location_from_answer(answer: Any, fallback_location: str = "", fallback_key: str = "") -> tuple[str, str]:
-    '''
-    now this function helps me to extract location when the user hasn't mentioned it clearly in their request
-    and the clarify node fires to ask them extra details and location is one of them.
-    '''
+
     raw = str(answer or "").strip()
     if not raw:
         return fallback_location, fallback_key
@@ -358,9 +366,97 @@ def vertical_policy(vertical: str | None) -> dict[str, Any]:
 
 
 '''
+this is for the memory query node, basically detects if the user is asking about something 
+from their past bookings, reservations, etc.
+'''
+def is_memory_query_request(user_request: str) -> bool:
+    query = (user_request or "").lower()
+    recall_markers = (
+        "what was",
+        "what's",
+        "what is",
+        "last",
+        "previous",
+        "recent",
+        "history",
+        "have i booked",
+        "did i book",
+        "where did i",
+        "remind me",
+    )
+    memory_markers = ("booked", "booking", "place", "restaurant", "class", "fitness")
+    return any(marker in query for marker in recall_markers) and any(marker in query for marker in memory_markers)
+
+
+
+def normalize_operation(parsed_operation: Any, user_request: str) -> str:
+    operation = str(parsed_operation or "").strip().lower()
+    if operation not in {"book", "memory_query"}:
+        operation = "memory_query" if is_memory_query_request(user_request) else "book"
+    if operation == "book" and is_memory_query_request(user_request):
+        return "memory_query"
+    return operation
+
+
+def is_reference_to_last_memory_request(user_request: str) -> bool:
+    query = (user_request or "").lower()
+    reference_markers = (
+        "that place",
+        "same place",
+        "that restaurant",
+        "same restaurant",
+        "that class",
+        "same class",
+        "book it again",
+        "book that again",
+        "book that place again",
+        "there again",
+    )
+    return any(marker in query for marker in reference_markers)
+
+
+def last_memory_booking_metadata(state: BookingState) -> dict[str, Any]:
+    event = state.get("last_memory_booking_event")
+    if not isinstance(event, dict):
+        return {}
+    metadata = event.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def resolve_last_memory_reference(
+    *,
+    state: BookingState,
+    user_request: str,
+    term: str,
+    raw_location: str,
+    location: str,
+    desired_location_key: str,
+) -> tuple[str, str, str, str]:
+    if not is_reference_to_last_memory_request(user_request):
+        return term, raw_location, location, desired_location_key
+
+    metadata = last_memory_booking_metadata(state)
+    if not metadata:
+        return term, raw_location, location, desired_location_key
+
+    venue_name = metadata.get("venue_name") or metadata.get("studio_name") or metadata.get("venue")
+    remembered_location = metadata.get("location") or raw_location
+
+    if venue_name and (not term or is_vague_dining_term(str(term))):
+        term = str(venue_name)
+    if remembered_location:
+        parsed_location, parsed_key = parse_desired_location(str(remembered_location), user_request)
+        raw_location = str(remembered_location)
+        location = parsed_location or str(remembered_location)
+        desired_location_key = parsed_key
+
+    return term, raw_location, location, desired_location_key
+
+
+'''
 now as there are minor changes when it comes to building payloads for verticals,
-I have used VERTICAL_POLICIES, which is a dictionary that stores some context on how to build 
-request payloads for the respective verticals
+I have used VERTICAL_POLICIES, which is a dictionary that gives some context on how to build 
+request payloads for the respective verticals by storing differences.
 '''
 
 def required_missing(state: BookingState) -> list[str]:
@@ -369,8 +465,8 @@ def required_missing(state: BookingState) -> list[str]:
     for field in policy["required_fields"]:
         if not state.get(field):
             missing.append(field)
-    if state.get("booking_datetime") and "datetime" not in missing and not has_explicit_time(state):
-        missing.append("datetime")
+    if state.get("booking_datetime") and "booking_datetime" not in missing and not has_explicit_time(state):
+        missing.append("booking_datetime")
     if (
         state.get("vertical") == "dining"
         and state.get("term")
@@ -549,7 +645,7 @@ def extract_profile_update_from_state(state: BookingState) -> dict[str, Any]:
     term = state.get("term")
     if vertical == "dining":
         cuisines = dining_preference_cuisines(state)
-        if term and not is_vague_dining_term(str(term)):
+        if term and not state.get("resolved_from_memory_reference") and not is_vague_dining_term(str(term)):
             cuisines.append(str(term))
         for cuisine in cuisines:
             cuisine_text = str(cuisine).strip()
@@ -653,6 +749,49 @@ def summary_booking_details(state: BookingState) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_memory_query_answer(
+    *,
+    vertical: str,
+    term: str,
+    event: dict[str, Any] | None,
+    used_fallback: bool = False,
+) -> str:
+    vertical_label = vertical or "booking"
+    term_text = term.strip() if term else ""
+    if not event:
+        if term_text:
+            return f"I couldn't find a previous {term_text} {vertical_label} booking in memory."
+        return f"I couldn't find a previous {vertical_label} booking in memory."
+
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    venue_name = metadata.get("venue_name") or metadata.get("studio_name") or metadata.get("venue") or "the stored result"
+    status = metadata.get("status") or "unknown"
+    booking_id = metadata.get("booking_id")
+    booking_datetime = metadata.get("datetime")
+    provider = metadata.get("provider")
+    content = event.get("content")
+
+    if used_fallback and term_text:
+        prefix = f"I couldn't find an exact {term_text} match, but the latest {vertical_label} booking I found was"
+    elif term_text:
+        prefix = f"The last {term_text} {vertical_label} booking I found was"
+    else:
+        prefix = f"The latest {vertical_label} booking I found was"
+
+    details = [f"{prefix} at {venue_name}."]
+    if booking_datetime:
+        details.append(f"Date/time: {booking_datetime}.")
+    if status:
+        details.append(f"Final status: {status}.")
+    if booking_id:
+        details.append(f"Booking ID: {booking_id}.")
+    if provider:
+        details.append(f"Provider: {provider}.")
+    if content:
+        details.append(f"Memory note: {content}")
+    return " ".join(details)
+
+
 
 '''
 this is for showing user a list of venues to choose from (for now I am only showing a max of 5, kinda helps 
@@ -696,6 +835,10 @@ def requested_time_label(booking_datetime: str) -> str:
     return parsed.strftime("%I:%M %p").lstrip("0")
 
 
+'''
+to sanitize error codes from Opehlia's API response, so that user is not bothered with ugly error codes.
+'''
+
 def safe_error_state(error: OpheliaAPIError) -> dict[str, Any]:
     return {
         "booking_status": "error",
@@ -729,6 +872,11 @@ def booking_error_code(response: dict[str, Any]) -> str | None:
     return None
 
 
+
+'''
+sanitizes the response from Opehlia's API and checks if there is a confirmation evidence.
+Thus, LLM doesn't hallucinate confirmation
+'''
 def has_confirmation_evidence(response: dict[str, Any]) -> bool:
     if not isinstance(response, dict):
         return False
@@ -773,10 +921,15 @@ async def main() -> None:
         org_id = state.get("org_id") or default_org_id
         user_id = state.get("user_id") or default_user_id
         vertical = state.get("vertical") or None
+
         logger.info("load_user_context_node: loading memory for org_id=%s user_id=%s", org_id, user_id)
+
+
         memory_store.ensure_user(org_id=org_id, user_id=user_id)
         profile = memory_store.get_profile(org_id=org_id, user_id=user_id)
         events = memory_store.recent_memory_events(org_id=org_id, user_id=user_id, vertical=vertical)
+
+
         return {
             "org_id": org_id,
             "user_id": user_id,
@@ -786,13 +939,18 @@ async def main() -> None:
         }
 
     async def extract_intent_node(state: BookingState) -> dict[str, Any]:
+
         logger.info("extract_intent_node: parsing user request")
+
         user_request = state.get("user_request", "")
         memory_context = state.get("memory_context", "No user memory available yet.")
+
+
         prompt = f"""
                 You extract booking intent for the Ophelia API.
 
                 Return ONLY valid JSON with these keys:
+                - operation: "book" or "memory_query"
                 - vertical: "dining" or "fitness"
                 - term: restaurant/cuisine/activity/event search term
                 - location: city/neighborhood/state/country text
@@ -803,6 +961,11 @@ async def main() -> None:
 
                 Rules:
                 - MVP supports dining and fitness.
+                - Use operation="book" when the user wants to search or create a new booking.
+                - Use operation="memory_query" when the user asks what they previously booked, where they went, booking history, recent bookings, or the last booking.
+                - Memory queries should not require location, datetime, or party_size.
+                - For "what was the last Indian place I booked?" operation is "memory_query", vertical is "dining", term is "Indian".
+                - For "what was my last fitness booking?" operation is "memory_query", vertical is "fitness", term can be empty.
                 - Do not invent missing values.
                 - For "Italian place in SoHo" term is "Italian" and location is "SoHo".
                 - For "table at South Bay in New Haven, CT" term is "South Bay" and location is "New Haven, CT".
@@ -818,18 +981,23 @@ async def main() -> None:
 
         last_error: Exception | None = None
         parsed: dict[str, Any] = {}
+        parse_succeeded = False
+
+
         for attempt in range(2):
             try:
                 resp = await model.ainvoke([("user", prompt)])
                 parsed = parse_json_object(resp.content)
+                parse_succeeded = True
                 break
             except Exception as exc:
                 last_error = exc
                 logger.warning("extract_intent_node: parse attempt %d failed: %s", attempt + 1, exc)
-        else:
+        if not parse_succeeded:
             logger.warning("extract_intent_node: falling back to clarification after parse failure: %s", last_error)
-            return {"missing_fields": ["term", "location", "datetime", "party_size"]}
+            return {"operation": "book", "missing_fields": ["term", "location", "datetime", "party_size"]}
 
+        operation = normalize_operation(parsed.get("operation"), user_request)
         vertical = (parsed.get("vertical") or "dining").lower()
 
         # I'm doing this temporarily for the MVP, but I'll have proper vertical support in the future
@@ -839,21 +1007,40 @@ async def main() -> None:
         booking_datetime = normalize_datetime(datetime_phrase, user_request)
         raw_location = parsed.get("location") or ""
         term = parsed.get("term") or ""
+
+        # useful when user says "resturant X in neighborhood Y"
         term, inferred_custom_location = split_named_place_and_location(
             term=term,
             raw_location=raw_location,
             user_request=user_request,
         )
+
+        # this function parses the desired location and returns the desired_location_key
+        
         location, desired_location_key = parse_desired_location(inferred_custom_location or raw_location, user_request)
+
+
         if inferred_custom_location and not desired_location_key:
             location = inferred_custom_location
-        party_size = parsed.get("party_size")
-        try:
-            party_size = int(party_size) if party_size is not None else None
-        except (TypeError, ValueError):
-            party_size = None
+
+        resolved_from_memory_reference = (
+            is_reference_to_last_memory_request(user_request)
+            and bool(last_memory_booking_metadata(state))
+        )
+        term, raw_location, location, desired_location_key = resolve_last_memory_reference(
+            state=state,
+            user_request=user_request,
+            term=term,
+            raw_location=raw_location,
+            location=location,
+            desired_location_key=desired_location_key,
+        )
+
+
+        party_size = int (parsed.get("party_size")) if parsed.get("party_size") is not None else None
 
         update: BookingState = {
+            "operation": operation,
             "vertical": vertical,
             "term": term,
             "raw_location": raw_location,
@@ -876,6 +1063,7 @@ async def main() -> None:
             "poll_attempts": 0,
             "memory_recorded": False,
             "profile_update_recorded": False,
+            "resolved_from_memory_reference": resolved_from_memory_reference,
         }
         if booking_datetime:
             update["booking_datetime"] = booking_datetime
@@ -886,12 +1074,14 @@ async def main() -> None:
 
         # if i have any missing values this where I call required_missing to
         # figure out the missing values for that particular vertical and then send
-        # control to clarify node to do the needful
-        update["missing_fields"] = required_missing(update)
+        # control to clarify node to do the needful but a memory operation query doesn't need this.
+        update["missing_fields"] = [] if operation == "memory_query" else required_missing(update)
         logger.info("extract_intent_node: extracted intent=%s", redact(update))
         return update
 
     def update_user_profile_node(state: BookingState) -> dict[str, Any]:
+        if state.get("operation") != "book":
+            return {"profile_update_recorded": True}
         if state.get("profile_update_recorded"):
             return {}
 
@@ -925,6 +1115,49 @@ async def main() -> None:
             logger.warning("update_user_profile_node: failed to update profile: %s", exc)
             return {}
 
+    def answer_memory_query_node(state: BookingState) -> dict[str, Any]:
+        org_id = state.get("org_id") or default_org_id
+        user_id = state.get("user_id") or default_user_id
+        vertical = (state.get("vertical") or "dining").lower()
+        term = state.get("term") or ""
+        logger.info("answer_memory_query_node: searching memory vertical=%s term=%s", vertical, term)
+
+        matches = memory_store.search_memory_events(
+            org_id=org_id,
+            user_id=user_id,
+            vertical=vertical,
+            memory_type="booking_history",
+            query=term or None,
+            limit=5,
+        )
+        used_fallback = False
+        if not matches and term:
+            matches = memory_store.search_memory_events(
+                org_id=org_id,
+                user_id=user_id,
+                vertical=vertical,
+                memory_type="booking_history",
+                limit=1,
+            )
+            used_fallback = bool(matches)
+
+        answer = format_memory_query_answer(
+            vertical=vertical,
+            term=term,
+            event=matches[0] if matches else None,
+            used_fallback=used_fallback,
+        )
+        logger.info("answer_memory_query_node: matches=%d used_fallback=%s", len(matches), used_fallback)
+        print("\n" + "=" * 60)
+        print(answer)
+        print("=" * 60 + "\n")
+        return {
+            "final_summary": answer,
+            "booking_status": "memory_answer",
+            "booking_succeeded": False,
+            "last_memory_booking_event": matches[0] if matches else {},
+        }
+
     def clarify_node(state: BookingState) -> dict[str, Any]:
         missing = required_missing(state)
         logger.info("clarify_node: missing fields=%s", missing)
@@ -951,7 +1184,7 @@ async def main() -> None:
                     "party_size": f"Based on your profile, this may be for {suggested_party_size} people. Confirm or enter another number."
                     if suggested_party_size
                     else "",
-                    "datetime": "Please include both date and time, e.g. 'tomorrow at 7 PM'.",
+                    "booking_datetime": "Please include both date and time, e.g. 'tomorrow at 7 PM'.",
                 },
             }
         )
@@ -964,7 +1197,12 @@ async def main() -> None:
             fallback_location=state.get("location", ""),
             fallback_key=state.get("desired_location_key", ""),
         )
-        datetime_phrase = answers.get("datetime") or answers.get("datetime_phrase") or state.get("datetime_phrase", "")
+        datetime_phrase = (
+            answers.get("booking_datetime")
+            or answers.get("datetime")
+            or answers.get("datetime_phrase")
+            or state.get("datetime_phrase", "")
+        )
         booking_datetime = normalize_datetime(datetime_phrase, f"{user_request} {datetime_phrase}")
         party_size = answers.get("party_size") or state.get("party_size")
         try:
@@ -991,6 +1229,9 @@ async def main() -> None:
     '''
     these are function for conditional edges of the graph
     '''
+    def route_after_extract(state: BookingState) -> Literal["answer_memory_query", "update_user_profile"]:
+        return "answer_memory_query" if state.get("operation") == "memory_query" else "update_user_profile"
+
     def route_after_intent(state: BookingState) -> Literal["clarify", "search"]:
         return "clarify" if required_missing(state) else "search"
 
@@ -1109,7 +1350,7 @@ async def main() -> None:
         }
         logger.info("availability_node: payload=%s", redact(payload))
 
-        # I am have this for a graceful fallback if neither of the above works
+        # I have this for a graceful fallback if neither of the above works (which it won't)
         try:
             response = await api.search_availability(payload)
         except OpheliaAPIError as exc:
@@ -1277,10 +1518,7 @@ async def main() -> None:
             "poll_attempts": 0,
         }
 
-    async def wait_for_provider_settle_after_continue(
-        booking_id: str,
-        initial_response: dict[str, Any],
-    ) -> dict[str, Any]:
+    async def wait_for_provider_settle_after_continue( booking_id: str, initial_response: dict[str, Any]) -> dict[str, Any]:
         error_code = booking_error_code(initial_response)
         if initial_response.get("status") in TERMINAL_STATUSES or error_code not in WAITABLE_PROVIDER_ERROR_CODES:
             return {
@@ -1467,6 +1705,7 @@ async def main() -> None:
             return "end"
         return "new_booking"
 
+# currently useless
     async def cancel_node(state: BookingState) -> dict[str, Any]:
         booking_id = state.get("booking_id")
         if not booking_id:
@@ -1487,6 +1726,7 @@ async def main() -> None:
     workflow = StateGraph(BookingState)
     workflow.add_node("load_user_context", load_user_context_node)
     workflow.add_node("extract_intent", extract_intent_node)
+    workflow.add_node("answer_memory_query", answer_memory_query_node)
     workflow.add_node("update_user_profile", update_user_profile_node)
     workflow.add_node("clarify", clarify_node)
     workflow.add_node("search", search_node)
@@ -1502,7 +1742,12 @@ async def main() -> None:
 
     workflow.add_edge(START, "load_user_context")
     workflow.add_edge("load_user_context", "extract_intent")
-    workflow.add_edge("extract_intent", "update_user_profile")
+    workflow.add_conditional_edges(
+        "extract_intent",
+        route_after_extract,
+        {"answer_memory_query": "answer_memory_query", "update_user_profile": "update_user_profile"},
+    )
+    workflow.add_edge("answer_memory_query", "wait_for_user")
     workflow.add_conditional_edges("update_user_profile", route_after_intent, {"clarify": "clarify", "search": "search"})
     workflow.add_edge("clarify", "update_user_profile")
     workflow.add_conditional_edges("search", route_after_search, {"select_venue": "select_venue", "summary": "summary"})
@@ -1554,7 +1799,12 @@ async def main() -> None:
         result = await app.ainvoke(Command(resume=resume_value), config=config)
 
     logger.info("Agent run finished")
-
+# {
+#                     "message": f"Booking {booking_id} requires an OTP.",
+#                     "booking_id": booking_id,
+#                     "next_action": next_action,
+#                     "fields_needed": ["otp_code"],
+#                 }
 
 def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
     print(f"\n{payload.get('message', 'Input needed')}")
@@ -1582,6 +1832,7 @@ def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
         "location": "location",
         "term": "cuisine/activity",
         "datetime": "date/time",
+        "booking_datetime": "date/time",
         "party_size": "party size",
         "selection": "venue selection",
         "approved": "approval",
