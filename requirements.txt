@@ -6,3 +6,6 @@ redis
 httpx
 dateparser
 sqlalchemy
+
+composio
+composio-langgraph

@@ -16,6 +16,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from memory_store import MemoryStore, build_memory_context
 from ophelia_client import OpheliaAPIClient, OpheliaAPIError, redact
+from composio_calendar import ComposioCalendarClient, ComposioCalendarError
 from utils.logger import agent_logger as logger
 
 
@@ -133,6 +134,22 @@ class BookingState(TypedDict, total=False):
     cancelled_on: str
     error: dict[str, Any]
     poll_attempts: int
+    current_user_name: str
+    current_user_email: str
+    guest_name: str
+    guest_email: str
+    calendar_requested: bool
+    calendar_checked: bool
+    requested_datetime_conflicts: bool
+    proposed_datetime: str
+    calendar_conflict_reason: str
+    calendar_invite_attempted: bool
+    calendar_event_created: bool
+    calendar_event_result: dict[str, Any]
+    calendar_error: dict[str, Any]
+    contact_resolution: dict[str, Any]
+    guest_notification_sent: bool
+    guest_notification_result: dict[str, Any]
 
 
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -909,8 +926,160 @@ def public_status_from_booking_response(response: dict[str, Any]) -> str:
     return status
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def canonical_env_name(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", (value or "").upper()).strip("_")
+
+
+def calendar_requested_from_text(user_request: str, guest_name: str = "") -> bool:
+    query = (user_request or "").lower()
+    explicit_markers = (
+        "calendar",
+        "invite",
+        "send an invite",
+        "add it to my cal",
+        "add to my cal",
+        "put it on my calendar",
+        "schedule it",
+    )
+    if any(marker in query for marker in explicit_markers):
+        return True
+    # A named guest implies calendar coordination in this demo flow.
+    return bool(guest_name)
+
+
+def extract_guest_name_from_request(user_request: str) -> str:
+    text = re.sub(r"\s+", " ", user_request or "").strip()
+    patterns = [
+        r"\bfor\s+(?P<guest>[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,3})\s+and\s+me\b",
+        r"\bwith\s+(?P<guest>[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,3})\b",
+        r"\bme\s+and\s+(?P<guest>[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,3})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            guest = match.group("guest").strip()
+            # Avoid interpreting cuisine/location words as people.
+            if guest.lower() not in {"italian", "soho", "dinner", "restaurant"}:
+                return guest
+    return ""
+
+
+def resolve_guest_email_from_env(guest_name: str) -> str:
+    if not guest_name:
+        return ""
+    candidates = [
+        f"{canonical_env_name(guest_name)}_EMAIL",
+        "TONY_STARK_EMAIL" if guest_name.lower() == "tony stark" else "",
+        "OPHELIA_GUEST_EMAIL",
+    ]
+    for key in candidates:
+        if key:
+            value = os.getenv(key, "").strip()
+            if value:
+                return value
+    return ""
+
+
+def parse_datetime_value(value: str) -> dt.datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def friendly_datetime(value: str) -> str:
+    parsed = parse_datetime_value(value)
+    if not parsed:
+        return value
+    return parsed.strftime("%A, %B %-d at %-I:%M %p")
+
+
+def event_duration_minutes(vertical: str | None) -> int:
+    return 60 if (vertical or "").lower() == "fitness" else 90
+
+
+def calendar_event_payload_from_state(state: BookingState) -> dict[str, Any]:
+    start = parse_datetime_value(state.get("booking_datetime", ""))
+    duration = event_duration_minutes(state.get("vertical"))
+    end = start + dt.timedelta(minutes=duration) if start else None
+    selected = state.get("selected_venue", {}) or {}
+    address = ", ".join(
+        str(selected.get(key, "")).strip()
+        for key in ("address", "city", "state")
+        if selected.get(key)
+    )
+    guest_name = state.get("guest_name") or "guest"
+    title = f"Dinner with {guest_name}" if state.get("vertical") == "dining" and guest_name else f"Ophelia booking: {selected.get('name') or 'booking'}"
+    confirmation = state.get("booking_response", {}).get("confirmation")
+    confirmation_code = ""
+    confirmation_message = ""
+    if isinstance(confirmation, dict):
+        confirmation_code = str(confirmation.get("confirmation_code") or confirmation.get("code") or "").strip()
+        confirmation_message = str(confirmation.get("message") or "").strip()
+    elif confirmation:
+        confirmation_message = str(redact(confirmation))
+    provider = selected_provider(state)
+    booking_id = state.get("booking_id") or ""
+    description_parts = [
+        f"Booking ID: {booking_id}",
+        f"Status: {state.get('booking_status') or ''}",
+        f"Provider: {provider}",
+    ]
+    if confirmation_code:
+        description_parts.append(f"Confirmation code: {confirmation_code}")
+    elif confirmation_message:
+        description_parts.append(f"Confirmation: {confirmation_message}")
+    if state.get("party_size"):
+        description_parts.append(f"Party size: {state.get('party_size')}")
+    return {
+        "title": title,
+        "guest_calendar_title": f"Dinner with {state.get('current_user_name') or 'Aldric'}" if state.get("vertical") == "dining" else title,
+        "start": start.isoformat() if start else state.get("booking_datetime"),
+        "end": end.isoformat() if end else "",
+        "venue_name": selected.get("name") or "",
+        "location": address or selected.get("name") or state.get("location") or "",
+        "description": "\n".join(part for part in description_parts if part),
+        "attendees": [state.get("guest_email")] if state.get("guest_email") else [],
+        "guest_email": state.get("guest_email") or "",
+        "guest_name": state.get("guest_name") or "",
+        "organizer_name": state.get("current_user_name") or "Aldric",
+        "booking_id": booking_id,
+        "provider": provider,
+        "confirmation_code": confirmation_code,
+        "confirmation_message": confirmation_message,
+        "party_size": state.get("party_size"),
+    }
+
+
+def should_attempt_calendar_invite(state: BookingState) -> bool:
+    return (
+        env_flag("COMPOSIO_ENABLE_CALENDAR", False)
+        and bool(state.get("calendar_requested"))
+        and state.get("booking_status") == "confirmed"
+        and not state.get("calendar_invite_attempted")
+    )
+
+
 
 async def main() -> None:
+    if "--connect-calendar" in sys.argv:
+        user_id = os.getenv("COMPOSIO_USER_ID") or os.getenv("OPHELIA_USER_ID", "demo_user")
+        try:
+            ComposioCalendarClient.from_env(user_id=user_id).connect_google_calendar()
+        except ComposioCalendarError as exc:
+            print(f"Calendar connection failed: {exc}")
+        return
+
     api = OpheliaAPIClient.from_env()
     memory_store = MemoryStore.from_env()
     default_org_id = os.getenv("OPHELIA_ORG_ID", "demo_org")
@@ -956,6 +1125,8 @@ async def main() -> None:
                 - location: city/neighborhood/state/country text
                 - datetime_phrase: exact natural language date/time phrase from the user, e.g. "today at 7pm"
                 - party_size: integer number of people/tickets when present, otherwise null
+                - guest_name: guest/contact name when the user names another person, otherwise empty string
+                - calendar_requested: true when the user asks for calendar/invite/scheduling, or names a guest for coordination
                 - preferences: object of soft preferences
                 - missing_fields: array of missing required fields for the selected vertical
 
@@ -968,8 +1139,9 @@ async def main() -> None:
                 - For "what was my last fitness booking?" operation is "memory_query", vertical is "fitness", term can be empty.
                 - Do not invent missing values.
                 - For "Italian place in SoHo" term is "Italian" and location is "SoHo".
-                - For "table at South Bay in New Haven, CT" term is "South Bay" and location is "New Haven, CT".
                 - For "pilates class near SoHo" vertical is "fitness" and term is "pilates".
+                - For "Steve Rogers and me" guest_name is "Steve Rogers" and party_size is 2.
+                - Treat "me" as the current user, not as a guest name.
                 - Keep datetime_phrase as natural language; do not normalize it.
                 - Use user memory only to refine soft preferences. Do not invent booking-critical fields.
 
@@ -1038,6 +1210,10 @@ async def main() -> None:
 
 
         party_size = int (parsed.get("party_size")) if parsed.get("party_size") is not None else None
+        guest_name = str(parsed.get("guest_name") or "").strip() or extract_guest_name_from_request(user_request)
+        calendar_requested = bool(parsed.get("calendar_requested")) or calendar_requested_from_text(user_request, guest_name)
+        if guest_name and party_size is None and vertical == "dining":
+            party_size = 2
 
         update: BookingState = {
             "operation": operation,
@@ -1064,6 +1240,22 @@ async def main() -> None:
             "memory_recorded": False,
             "profile_update_recorded": False,
             "resolved_from_memory_reference": resolved_from_memory_reference,
+            "current_user_name": os.getenv("c", "Aldric"),
+            "current_user_email": os.getenv("OPHELIA_USER_EMAIL", ""),
+            "guest_name": guest_name,
+            "guest_email": "",
+            "calendar_requested": calendar_requested,
+            "calendar_checked": False,
+            "requested_datetime_conflicts": False,
+            "proposed_datetime": "",
+            "calendar_conflict_reason": "",
+            "calendar_invite_attempted": False,
+            "calendar_event_created": False,
+            "calendar_event_result": {},
+            "calendar_error": {},
+            "contact_resolution": {},
+            "guest_notification_sent": False,
+            "guest_notification_result": {},
         }
         if booking_datetime:
             update["booking_datetime"] = booking_datetime
@@ -1078,6 +1270,140 @@ async def main() -> None:
         update["missing_fields"] = [] if operation == "memory_query" else required_missing(update)
         logger.info("extract_intent_node: extracted intent=%s", redact(update))
         return update
+
+    async def resolve_people_context_node(state: BookingState) -> dict[str, Any]:
+        user_request = state.get("user_request", "")
+        guest_name = state.get("guest_name") or extract_guest_name_from_request(user_request)
+        guest_email = state.get("guest_email") or ""
+        calendar_requested = bool(state.get("calendar_requested")) or calendar_requested_from_text(user_request, guest_name)
+        contact_resolution: dict[str, Any] = {}
+
+        if calendar_requested and guest_name and not guest_email and env_flag("COMPOSIO_ENABLE_CALENDAR", False):
+            user_id = os.getenv("COMPOSIO_USER_ID") or state.get("user_id") or default_user_id
+            try:
+                client = ComposioCalendarClient.from_env(user_id=user_id)
+                contact_resolution = await asyncio.to_thread(client.resolve_contact_email, guest_name)
+                if contact_resolution.get("found") and contact_resolution.get("email"):
+                    guest_email = str(contact_resolution["email"]).strip()
+            except ComposioCalendarError as exc:
+                logger.warning("resolve_people_context_node contact lookup: %s", exc)
+                contact_resolution = {"found": False, "source": "google_contacts", "reason": str(exc)}
+
+        if not guest_email:
+            guest_email = resolve_guest_email_from_env(guest_name)
+            if guest_email and not contact_resolution:
+                contact_resolution = {"found": True, "source": "env_fallback", "email": guest_email, "name": guest_name}
+
+        update: BookingState = {
+            "current_user_name": os.getenv("OPHELIA_USER_NAME", "Aldric"),
+            "current_user_email": os.getenv("OPHELIA_USER_EMAIL", ""),
+            "guest_name": guest_name,
+            "guest_email": guest_email,
+            "calendar_requested": calendar_requested,
+            "contact_resolution": contact_resolution,
+        }
+        if guest_name and not state.get("party_size") and state.get("vertical") == "dining":
+            update["party_size"] = 2
+            merged = {**state, **update}
+            update["missing_fields"] = required_missing(merged)
+        logger.info("resolve_people_context_node: people=%s", redact(update))
+        return update
+
+    async def check_calendar_availability_node(state: BookingState) -> dict[str, Any]:
+        if not state.get("calendar_requested"):
+            return {"calendar_checked": False}
+        if not env_flag("COMPOSIO_ENABLE_CALENDAR", False):
+            return {
+                "calendar_checked": False,
+                "calendar_error": {"category": "calendar_disabled", "message": "Set COMPOSIO_ENABLE_CALENDAR=true to check calendar availability."},
+            }
+        if not state.get("booking_datetime"):
+            return {"calendar_checked": False}
+
+        user_id = os.getenv("COMPOSIO_USER_ID") or state.get("user_id") or default_user_id
+        try:
+            client = ComposioCalendarClient.from_env(user_id=user_id)
+            result = await asyncio.to_thread(
+                client.check_availability,
+                start_iso=state["booking_datetime"],
+                duration_minutes=event_duration_minutes(state.get("vertical")),
+                current_user_name=state.get("current_user_name") or "Aldric",
+                guest_name=state.get("guest_name") or "",
+                guest_email=state.get("guest_email") or "",
+            )
+        except ComposioCalendarError as exc:
+            logger.warning("check_calendar_availability_node: %s", exc)
+            return {
+                "calendar_checked": False,
+                "calendar_error": {"category": "composio", "message": str(exc)},
+            }
+
+        available = bool(result.get("available"))
+        proposed = str(result.get("proposed_datetime") or "").strip()
+        conflict_reason = str(result.get("reason") or result.get("conflict_reason") or "").strip()
+        return {
+            "calendar_checked": True,
+            "requested_datetime_conflicts": not available,
+            "proposed_datetime": proposed,
+            "calendar_conflict_reason": conflict_reason,
+            "calendar_event_result": {"availability": result},
+        }
+
+    def route_after_calendar_check(state: BookingState) -> Literal["propose_alternate_time", "update_user_profile"]:
+        if state.get("requested_datetime_conflicts") and state.get("proposed_datetime"):
+            return "propose_alternate_time"
+        return "update_user_profile"
+
+    def propose_alternate_time_node(state: BookingState) -> dict[str, Any]:
+        proposed = state.get("proposed_datetime") or ""
+        proposed_label = friendly_datetime(proposed)
+        reason = state.get("calendar_conflict_reason") or "The requested time conflicts with one or more calendars."
+        answer = interrupt(
+            {
+                "message": f"Calendar conflict: {reason}\nSuggested alternate time: {proposed_label}",
+                "fields_needed": ["alternate_time_approval"],
+                "field_suggestions": {
+                    "alternate_time_approval": "Type yes to use the suggested time, or no to enter a custom time.",
+                },
+            }
+        )
+        approved = str(answer.get("alternate_time_approval", "")).strip().lower() in {"y", "yes", "true", "approve", "approved"}
+        if approved:
+            return {
+                "booking_datetime": proposed,
+                "datetime_phrase": proposed_label,
+                "requested_datetime_conflicts": False,
+                "calendar_conflict_reason": "",
+            }
+
+        custom_answer = interrupt(
+            {
+                "message": "What date and time should I try instead?",
+                "fields_needed": ["booking_datetime"],
+                "field_suggestions": {
+                    "booking_datetime": "Enter a new time like 'tomorrow at 8:45 PM', or type cancel.",
+                },
+            }
+        )
+        custom_time = str(custom_answer.get("booking_datetime") or "").strip()
+        if custom_time.lower() in {"cancel", "exit", "quit", "no"}:
+            return {
+                "booking_status": "cancelled",
+                "booking_response": {"status": "cancelled", "reason": "User declined the calendar-safe alternate time."},
+            }
+        if custom_time:
+            normalized = normalize_datetime(custom_time, f"{state.get('user_request', '')} {custom_time}")
+            if normalized:
+                return {
+                    "booking_datetime": normalized,
+                    "datetime_phrase": custom_time,
+                    "requested_datetime_conflicts": False,
+                    "calendar_conflict_reason": "",
+                }
+        return {
+            "booking_status": "cancelled",
+            "booking_response": {"status": "cancelled", "reason": "No valid alternate time was provided."},
+        }
 
     def update_user_profile_node(state: BookingState) -> dict[str, Any]:
         if state.get("operation") != "book":
@@ -1229,10 +1555,12 @@ async def main() -> None:
     '''
     these are function for conditional edges of the graph
     '''
-    def route_after_extract(state: BookingState) -> Literal["answer_memory_query", "update_user_profile"]:
-        return "answer_memory_query" if state.get("operation") == "memory_query" else "update_user_profile"
+    def route_after_extract(state: BookingState) -> Literal["answer_memory_query", "resolve_people_context"]:
+        return "answer_memory_query" if state.get("operation") == "memory_query" else "resolve_people_context"
 
-    def route_after_intent(state: BookingState) -> Literal["clarify", "search"]:
+    def route_after_intent(state: BookingState) -> Literal["clarify", "search", "summary"]:
+        if state.get("booking_status") in TERMINAL_STATUSES:
+            return "summary"
         return "clarify" if required_missing(state) else "search"
 
     def route_after_search(state: BookingState) -> Literal["select_venue", "summary"]:
@@ -1468,12 +1796,14 @@ async def main() -> None:
             "poll_attempts": 0,
         }
 
-    def route_after_status(state: BookingState) -> Literal["poll", "action", "summary"]:
+    def route_after_status(state: BookingState) -> Literal["poll", "action", "calendar_invite", "summary"]:
         status = state.get("booking_status", "")
         if status == "processing":
             return "poll"
         if status == "requires_action":
             return "action"
+        if should_attempt_calendar_invite(state):
+            return "calendar_invite"
         return "summary"
 
     async def poll_booking_node(state: BookingState) -> dict[str, Any]:
@@ -1617,6 +1947,44 @@ async def main() -> None:
 
         return await wait_for_provider_settle_after_continue(booking_id, response)
 
+    async def create_calendar_invite_node(state: BookingState) -> dict[str, Any]:
+        if not should_attempt_calendar_invite(state):
+            return {"calendar_invite_attempted": True}
+        if not state.get("guest_email") and state.get("guest_name"):
+            details = interrupt(
+                {
+                    "message": f"I can send {state.get('guest_name')} the dinner details. What email should I use?",
+                    "fields_needed": ["guest_email"],
+                }
+            )
+            guest_email = str(details.get("guest_email") or "").strip()
+        else:
+            guest_email = state.get("guest_email") or ""
+
+        user_id = os.getenv("COMPOSIO_USER_ID") or state.get("user_id") or default_user_id
+        payload = calendar_event_payload_from_state({**state, "guest_email": guest_email})
+        try:
+            client = ComposioCalendarClient.from_env(user_id=user_id)
+            result = await asyncio.to_thread(client.send_guest_invite_email, event=payload)
+        except ComposioCalendarError as exc:
+            logger.warning("create_calendar_invite_node: %s", exc)
+            return {
+                "guest_email": guest_email,
+                "calendar_invite_attempted": True,
+                "calendar_event_created": False,
+                "guest_notification_sent": False,
+                "calendar_error": {"category": "composio", "message": str(exc)},
+            }
+        return {
+            "guest_email": guest_email,
+            "calendar_invite_attempted": True,
+            "calendar_event_created": False,
+            "calendar_event_result": {},
+            "guest_notification_sent": True,
+            "guest_notification_result": result,
+            "calendar_error": {},
+        }
+
     async def summary_node(state: BookingState) -> dict[str, Any]:
         status = state.get("booking_status", "unknown")
         succeeded = status == "confirmed"
@@ -1638,6 +2006,15 @@ async def main() -> None:
             "party_size": state.get("party_size") if vertical_policy(state.get("vertical")).get("include_party_size_in_booking") else None,
             "error": state.get("error"),
             "booking_response": redact(state.get("booking_response", {})),
+            "calendar_requested": state.get("calendar_requested", False),
+            "calendar_event_created": state.get("calendar_event_created", False),
+            "calendar_event_result": redact(state.get("calendar_event_result", {})),
+            "calendar_error": redact(state.get("calendar_error", {})),
+            "contact_resolution": redact(state.get("contact_resolution", {})),
+            "guest_notification_sent": state.get("guest_notification_sent", False),
+            "guest_notification_result": redact(state.get("guest_notification_result", {})),
+            "guest_name": state.get("guest_name"),
+            "guest_email": state.get("guest_email"),
         }
         prompt = f"""
                     Write a short user-facing booking result.
@@ -1645,7 +2022,11 @@ async def main() -> None:
                     If status is verification_required, explicitly say the booking could not be verified as confirmed yet.
                     If failed/error/rate_limited/expired, be honest and include the sanitized error code if present.
                     Use the selected_result and Booking Details keys that are present.
-                    Do not mention missing fields, and do not invent a guest name, party size, class time, venue, or confirmation code.
+                    Do not mention missing fields, and do not invent a guest name, party size, class time, venue, calendar event, or confirmation code.
+                    If contact_resolution found an email through Google Contacts, mention that the guest was resolved from contacts only if it helps explain the guest notification.
+                    If guest_notification_sent is true, say a guest invitation email was sent to guest_name at guest_email.
+                    Do not claim a Google Calendar event was created by this agent unless calendar_event_created is true.
+                    If calendar_requested is true but calendar_error is present, say the booking status separately from the guest notification failure.
 
                     {booking_details}
 
@@ -1727,6 +2108,9 @@ async def main() -> None:
     workflow.add_node("load_user_context", load_user_context_node)
     workflow.add_node("extract_intent", extract_intent_node)
     workflow.add_node("answer_memory_query", answer_memory_query_node)
+    workflow.add_node("resolve_people_context", resolve_people_context_node)
+    workflow.add_node("check_calendar_availability", check_calendar_availability_node)
+    workflow.add_node("propose_alternate_time", propose_alternate_time_node)
     workflow.add_node("update_user_profile", update_user_profile_node)
     workflow.add_node("clarify", clarify_node)
     workflow.add_node("search", search_node)
@@ -1736,6 +2120,7 @@ async def main() -> None:
     workflow.add_node("create", create_booking_node)
     workflow.add_node("poll", poll_booking_node)
     workflow.add_node("action", continue_booking_node)
+    workflow.add_node("calendar_invite", create_calendar_invite_node)
     workflow.add_node("summary", summary_node)
     workflow.add_node("wait_for_user", waiting_node)
     workflow.add_node("cancel", cancel_node)
@@ -1745,10 +2130,17 @@ async def main() -> None:
     workflow.add_conditional_edges(
         "extract_intent",
         route_after_extract,
-        {"answer_memory_query": "answer_memory_query", "update_user_profile": "update_user_profile"},
+        {"answer_memory_query": "answer_memory_query", "resolve_people_context": "resolve_people_context"},
     )
     workflow.add_edge("answer_memory_query", "wait_for_user")
-    workflow.add_conditional_edges("update_user_profile", route_after_intent, {"clarify": "clarify", "search": "search"})
+    workflow.add_edge("resolve_people_context", "check_calendar_availability")
+    workflow.add_conditional_edges(
+        "check_calendar_availability",
+        route_after_calendar_check,
+        {"propose_alternate_time": "propose_alternate_time", "update_user_profile": "update_user_profile"},
+    )
+    workflow.add_edge("propose_alternate_time", "update_user_profile")
+    workflow.add_conditional_edges("update_user_profile", route_after_intent, {"clarify": "clarify", "search": "search", "summary": "summary"})
     workflow.add_edge("clarify", "update_user_profile")
     workflow.add_conditional_edges("search", route_after_search, {"select_venue": "select_venue", "summary": "summary"})
     workflow.add_edge("select_venue", "availability")
@@ -1758,9 +2150,10 @@ async def main() -> None:
         {"preflight_and_consent": "preflight_and_consent", "summary": "summary"},
     )
     workflow.add_conditional_edges("preflight_and_consent", route_after_consent, {"create": "create", "summary": "summary"})
-    workflow.add_conditional_edges("create", route_after_status, {"poll": "poll", "action": "action", "summary": "summary"})
-    workflow.add_conditional_edges("poll", route_after_status, {"poll": "poll", "action": "action", "summary": "summary"})
-    workflow.add_conditional_edges("action", route_after_status, {"poll": "poll", "action": "action", "summary": "summary"})
+    workflow.add_conditional_edges("create", route_after_status, {"poll": "poll", "action": "action", "calendar_invite": "calendar_invite", "summary": "summary"})
+    workflow.add_conditional_edges("poll", route_after_status, {"poll": "poll", "action": "action", "calendar_invite": "calendar_invite", "summary": "summary"})
+    workflow.add_conditional_edges("action", route_after_status, {"poll": "poll", "action": "action", "calendar_invite": "calendar_invite", "summary": "summary"})
+    workflow.add_edge("calendar_invite", "summary")
     workflow.add_edge("summary", "wait_for_user")
     workflow.add_edge("cancel", "summary")
     workflow.add_conditional_edges(
@@ -1837,6 +2230,8 @@ def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
         "selection": "venue selection",
         "approved": "approval",
         "otp_code": "OTP code",
+        "alternate_time_approval": "alternate time approval",
+        "guest_email": "guest email",
     }
     if len(fields) > 1:
         needed = ", ".join(field_labels.get(field, field.replace("_", " ")) for field in fields)
@@ -1869,6 +2264,10 @@ def prompt_for_interrupt(payload: dict[str, Any]) -> Any:
             answers[field] = input(f"{label.title()}: ").strip()
         elif field == "otp_code":
             answers[field] = input("OTP code: ").strip()
+        elif field == "alternate_time_approval":
+            answers[field] = input("Use suggested alternate time? Type yes/no: ").strip()
+        elif field == "guest_email":
+            answers[field] = input("Guest email: ").strip()
         else:
             answers[field] = input(f"{label.title()}: ").strip()
     return answers
