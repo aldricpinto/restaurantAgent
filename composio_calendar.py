@@ -7,40 +7,20 @@ from urllib.parse import quote_plus
 from dataclasses import dataclass
 from typing import Any
 
-from langchain.agents import create_agent
-from langchain_groq import ChatGroq
 
-
+'''
+Used to raise an error when a Composio-backed Google action cannot be completed cleanly.
+'''
 class ComposioCalendarError(Exception):
     pass
 
 
-def _parse_json_object(text: str) -> dict[str, Any]:
-    raw = (text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?", "", raw).strip()
-        raw = re.sub(r"```$", "", raw).strip()
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not match:
-            raise
-        parsed = json.loads(match.group(0))
-    return parsed if isinstance(parsed, dict) else {"result": parsed}
-
-
-def _last_message_content(result: Any) -> str:
-    if isinstance(result, dict):
-        messages = result.get("messages") or []
-        if messages:
-            last = messages[-1]
-            return str(getattr(last, "content", last.get("content") if isinstance(last, dict) else last))
-        return str(result)
-    return str(result)
-
-
+'''
+this is used for traversing every nested dict/list value in a Composio response,
+without caring about its exact shape.
+'''
 def _iter_values(value: Any):
+
     if isinstance(value, dict):
         yield value
         for child in value.values():
@@ -50,7 +30,12 @@ def _iter_values(value: Any):
             yield from _iter_values(child)
 
 
+'''
+this is used to find first usable email/name pair 
+inside a Google Contacts response.
+'''
 def _first_email_from_contacts_payload(payload: Any) -> tuple[str, str]:
+
     for item in _iter_values(payload):
         email_addresses = item.get("emailAddresses")
         if not isinstance(email_addresses, list):
@@ -67,7 +52,12 @@ def _first_email_from_contacts_payload(payload: Any) -> tuple[str, str]:
     return "", ""
 
 
+'''
+this is used to extract the most helpful human-readable error 
+from a deeply nested Composio payload.
+'''
 def _best_error_message(payload: Any) -> str:
+
     fallback = ""
     for item in _iter_values(payload):
         message = item.get("message")
@@ -79,7 +69,12 @@ def _best_error_message(payload: Any) -> str:
     return fallback or str(payload)
 
 
+'''
+this is used to return true when one Google Calendar free slot 
+fully covers the requested booking window.
+'''
 def _contains_interval(container: dict[str, Any], start: dt.datetime, end: dt.datetime) -> bool:
+
     free_start = dt.datetime.fromisoformat(str(container.get("start", "")).replace("Z", "+00:00"))
     free_end = dt.datetime.fromisoformat(str(container.get("end", "")).replace("Z", "+00:00"))
     probe_start = start
@@ -90,7 +85,12 @@ def _contains_interval(container: dict[str, Any], start: dt.datetime, end: dt.da
     return free_start <= probe_start and probe_end <= free_end
 
 
+'''
+I use this to parse the datetime strings we pass 
+between the agent and Google tools.
+'''
 def _parse_iso(value: str) -> dt.datetime | None:
+    
     if not value:
         return None
     try:
@@ -99,21 +99,34 @@ def _parse_iso(value: str) -> dt.datetime | None:
         return None
 
 
+'''
+this is used to turn an internal ISO datetime into a friendly line for guest-facing emails.
+'''
 def _display_datetime(value: str) -> str:
+
     parsed = _parse_iso(value)
     if not parsed:
         return value
     return parsed.strftime("%A, %B %-d, %Y at %-I:%M %p")
 
 
+'''
+using this to format a datetime for Google Calendar's URL template format.
+'''
 def _calendar_datetime(value: str) -> str:
+
     parsed = _parse_iso(value)
     if not parsed:
         return ""
     return parsed.strftime("%Y%m%dT%H%M%S")
 
 
+'''
+I use this to build an "Add to Google Calendar" link 
+so guests can add the booking to their calendar themselves.
+'''
 def _google_calendar_link(event: dict[str, Any]) -> str:
+
     start = _calendar_datetime(str(event.get("start") or ""))
     end = _calendar_datetime(str(event.get("end") or ""))
     if not start or not end:
@@ -129,28 +142,42 @@ def _google_calendar_link(event: dict[str, Any]) -> str:
     return f"https://calendar.google.com/calendar/render?{query}"
 
 
+
+'''
+I created this to keep all Composio/Google behavior out of the main booking graph.
+This is a small adapter that keeps all Composio/Google behavior out of the main booking graph.
+'''
 @dataclass
 class ComposioCalendarClient:
+
     user_id: str
-    model_name: str = "openai/gpt-oss-120b"
     toolkit: str = "googlecalendar"
     contacts_toolkit: str = "googlecontacts"
     gmail_toolkit: str = "gmail"
 
+
+    '''
+    I use this to create the adapter from `.env`.
+    '''
     @classmethod
     def from_env(cls, user_id: str | None = None) -> "ComposioCalendarClient":
+
         api_key = os.getenv("COMPOSIO_API_KEY", "").strip()
         if not api_key:
             raise ComposioCalendarError("COMPOSIO_API_KEY is required for calendar integration.")
         return cls(
             user_id=user_id or os.getenv("COMPOSIO_USER_ID") or os.getenv("OPHELIA_USER_ID", "demo_user"),
-            model_name=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
             toolkit=os.getenv("COMPOSIO_CALENDAR_TOOLKIT", "googlecalendar"),
             contacts_toolkit=os.getenv("COMPOSIO_CONTACTS_TOOLKIT", "googlecontacts"),
             gmail_toolkit=os.getenv("COMPOSIO_GMAIL_TOOLKIT", "gmail"),
         )
 
+
+    '''
+    I use this to find the Composio auth config ID for a Google toolkit.
+    '''
     def _auth_config_id(self, toolkit: str) -> str:
+
         normalized = re.sub(r"[^A-Z0-9]+", "_", toolkit.upper()).strip("_")
         candidates = [
             f"COMPOSIO_{normalized}_AUTH_CONFIG_ID",
@@ -167,7 +194,13 @@ class ComposioCalendarClient:
                 return value
         return ""
 
+
+    '''
+    I use this to open a Composio session for this user
+    and the exact Google toolkit we need right now.
+    '''
     def _session(self, toolkits: list[str] | None = None) -> Any:
+
         os.environ.setdefault("COMPOSIO_CACHE_DIR", "/private/tmp/ophelia-composio-cache")
         try:
             from composio import Composio
@@ -183,7 +216,7 @@ class ComposioCalendarClient:
         if self.contacts_toolkit in requested_toolkits and self.contacts_toolkit not in auth_configs:
             raise ComposioCalendarError(
                 "Google Contacts requires a Composio auth config. Set COMPOSIO_CONTACTS_AUTH_CONFIG_ID "
-                "from your Composio dashboard, or use an env email fallback for demos."
+                "from your Composio dashboard, or use an .env email fallback to test locally"
             )
         try:
             return composio.create(
@@ -193,16 +226,16 @@ class ComposioCalendarClient:
                 sandbox={"enable": False},
             )
         except TypeError:
-            # Older/newer SDKs may expose a narrower create() signature.
+           # trying again with a narrower create() method
             return composio.create(user_id=self.user_id)
 
-    def _agent(self, toolkits: list[str] | None = None) -> Any:
-        session = self._session(toolkits=toolkits)
-        tools = session.tools()
-        llm = ChatGroq(model_name=self.model_name)
-        return create_agent(tools=tools, model=llm)
 
+    '''
+    I created this to run one concrete Composio tool directly,
+    this helps me avoid huge tool schemas in the LLM prompt (saving tokens!!!!!!)
+    '''
     def _execute_tool(self, toolkit: str, tool_slug: str, arguments: dict[str, Any], *, step: str) -> dict[str, Any]:
+
         tools = {tool.name: tool for tool in self._session(toolkits=[toolkit]).tools()}
         execute = tools.get("COMPOSIO_MULTI_EXECUTE_TOOL")
         if execute is None:
@@ -221,7 +254,13 @@ class ComposioCalendarClient:
             raise ComposioCalendarError(f"{tool_slug} failed: {_best_error_message(result)}")
         return result
 
+
+    '''
+    Used to get a browser link that lets the current user connect
+    one Google capability (Google Calendar, Google Contacts, Gmail).
+    '''
     def _authorize_toolkit(self, toolkit: str, label: str) -> None:
+
         session = self._session(toolkits=[toolkit])
         try:
             request = session.authorize(toolkit)
@@ -249,6 +288,12 @@ class ComposioCalendarClient:
                 raise ComposioCalendarError(f"{label} connection failed: {exc}") from exc
             print(f"{label} connected.")
 
+
+    '''
+    Used to connect Calendar, Contacts, and Gmail for the demo user,
+    one browser consent flow at a time and _authorize_toolkit is used to get me
+    the needed links.
+    '''
     def connect_google_calendar(self) -> None:
         self._authorize_toolkit(self.toolkit, "Google Calendar")
         try:
@@ -260,11 +305,17 @@ class ComposioCalendarClient:
         except ComposioCalendarError as exc:
             print(f"Gmail connection skipped or failed: {exc}")
 
+
+    '''
+    I created this to resolve a guest's email address from the user's Google Contacts.
+    '''
     def resolve_contact_email(self, guest_name: str) -> dict[str, Any]:
+        
         if not guest_name.strip():
             return {"found": False, "name": "", "email": "", "source": "none", "reason": "No guest name provided."}
 
-        # Google People search can return stale/missing results unless the search cache is warmed first.
+        # Searching cache first (WARM_CONTACTS_SEARCH), if it fails I call (SEARCH_CONTACTS) as a fallback.
+        # This avoids huge tool schemas in the LLM prompt (again saving tokens!!!!!!)
         try:
             self._execute_tool(
                 self.contacts_toolkit,
@@ -273,7 +324,7 @@ class ComposioCalendarClient:
                 step="WARM_CONTACTS_SEARCH",
             )
         except ComposioCalendarError:
-            # The real search below should surface any actionable error.
+            
             pass
 
         result = self._execute_tool(
@@ -300,15 +351,13 @@ class ComposioCalendarClient:
             "reason": "Resolved through Google Contacts.",
         }
 
-    def check_availability(
-        self,
-        *,
-        start_iso: str,
-        duration_minutes: int,
-        current_user_name: str,
-        guest_name: str = "",
-        guest_email: str = "",
-    ) -> dict[str, Any]:
+
+    '''
+    Using this to check whether the requested dinner or class time is free
+    on the user's and guest's calendars.
+    '''
+    def check_availability(self, *, start_iso: str, duration_minutes: int, current_user_name: str, guest_name: str = "", guest_email: str = "",) -> dict[str, Any]:
+       
         start = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
         end = start + dt.timedelta(minutes=duration_minutes)
         window_start = start - dt.timedelta(hours=2)
@@ -368,6 +417,11 @@ class ComposioCalendarClient:
             "raw": result,
         }
 
+
+    '''
+    Used to email the guest a polished booking notification
+    along with an 'Add to Google Calendar' link.
+    '''
     def send_guest_invite_email(self, *, event: dict[str, Any]) -> dict[str, Any]:
         attendees = []
         for attendee in event.get("attendees", []):
@@ -449,6 +503,10 @@ class ComposioCalendarClient:
             "raw": result,
         }
 
+
+    '''
+    I use this to create an event on the user's Google Calendar.
+    '''
     def create_event(self, *, event: dict[str, Any]) -> dict[str, Any]:
         start = str(event.get("start") or "")
         end = str(event.get("end") or "")
