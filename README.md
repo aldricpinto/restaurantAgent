@@ -1,6 +1,6 @@
 # Cross-Vertical Booking AI Agent MVP
 
-Direct REST AI agent prototype for booking through the Ophelia API.
+
 
 The agent uses:
 
