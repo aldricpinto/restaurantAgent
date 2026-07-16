@@ -1,6 +1,26 @@
 # Cross-Vertical Booking AI Agent MVP
 
+```mermaid
+flowchart LR
+    user[User / CLI] --> agent[agent.py<br/>LangGraph booking agent]
 
+    agent --> groq[Groq LLM<br/>ChatGroq]
+    agent --> memory[MemoryStore<br/>memory_store.py]
+    memory --> models[SQLAlchemy models<br/>models.py]
+    models --> sqlite[(SQLite<br/>ophelia_agent_memory.db)]
+
+    agent --> redis[(Redis<br/>rate limit + cool-off)]
+    agent --> ophelia[OpheliaAPIClient<br/>ophelia_client.py]
+    ophelia --> opheliaApi[Ophelia REST API<br/>venues, availability, bookings]
+
+    agent --> composio[ComposioCalendarClient<br/>composio_calendar.py]
+    composio --> contacts[Google Contacts<br/>guest lookup]
+    composio --> calendar[Google Calendar<br/>availability]
+    composio --> gmail[Gmail<br/>guest notification]
+
+    agent --> logger[utils/logger.py<br/>ophelia.log]
+    agent --> graphPng[workflow.png<br/>generated graph image]
+```
 
 The agent uses:
 
