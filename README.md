@@ -1,33 +1,30 @@
-# Cross-Vertical Booking AI Agent MVP
+# Cross-Vertical ReAct Booking Agent with MCP
 
 ```mermaid
 flowchart LR
-    user[User / CLI] --> agent[agent.py<br/>LangGraph booking agent]
+    user[User / CLI] --> agent[agent.py<br/>ReAct booking agent]
 
     agent --> groq[Groq LLM<br/>ChatGroq]
-    agent --> memory[MemoryStore<br/>memory_store.py]
-    memory --> models[SQLAlchemy models<br/>models.py]
-    models --> sqlite[(SQLite<br/>ophelia_agent_memory.db)]
-
-    agent --> redis[(Redis<br/>rate limit + cool-off)]
-    agent --> ophelia[OpheliaAPIClient<br/>ophelia_client.py]
+    agent <-->|stdio MCP| mcp[mcp_server.py<br/>FastMCP tool server]
+    mcp --> ophelia[OpheliaAPIClient<br/>ophelia_client.py]
     ophelia --> opheliaApi[Ophelia REST API<br/>venues, availability, bookings]
 
-    agent --> composio[ComposioCalendarClient<br/>composio_calendar.py]
+    mcp --> composio[ComposioCalendarClient<br/>composio_calendar.py]
     composio --> contacts[Google Contacts<br/>guest lookup]
     composio --> calendar[Google Calendar<br/>availability]
     composio --> gmail[Gmail<br/>guest notification]
 
-    agent --> logger[utils/logger.py<br/>ophelia.log]
-    agent --> graphPng[workflow.png<br/>generated graph image]
+    legacy[legacy_agent.py] --> graph[Legacy deterministic LangGraph]
 ```
 
-The agent uses:
+The default agent uses:
 
-- LangGraph for the state machine and interrupt/resume flow
-- Groq/LangChain for LLM intent extraction and grounded summaries
-- Direct HTTPS calls to the Ophelia REST API
-- SQLite + SQLAlchemy for local user profile and memory
+- LangChain `create_agent` for a model-directed ReAct tool loop
+- MCP over stdio for all Ophelia and Composio actions
+- Groq as the tool-calling model
+- Explicit confirmation and idempotency guards inside the MCP server
+
+The former deterministic LangGraph is preserved as `legacy_agent.py`.
 
 
 ## 1. Prerequisites
@@ -156,6 +153,23 @@ You can also pass the first user request as command-line text:
 uv run agent.py "Book me an Italian restaurant in SoHo tomorrow at 8 PM for 2 people"
 ```
 
+The CLI remains open after the first response so the ReAct agent can ask for
+missing details, venue selection, and explicit confirmation.
+
+To run the tool server by itself for an MCP client or inspector:
+
+```bash
+uv run mcp_server.py
+```
+
+It uses stdio transport. The default `agent.py` starts this server automatically.
+
+To run the previous deterministic graph during migration:
+
+```bash
+uv run legacy_agent.py
+```
+
 ## 5. Example flows
 
 Dining booking:
@@ -226,7 +240,7 @@ The agent does not create a duplicate host calendar event after booking. OpenTab
 uv run agent.py --connect-calendar
 ```
 
-Despite the command name, it attempts to connect Calendar, Contacts, and Gmail.
+Despite the legacy command name, it attempts to connect Calendar, Contacts, and Gmail.
 
 Then run a calendar-aware request:
 
@@ -241,4 +255,5 @@ Troubleshooting:
 - If Google says the app is blocked because it has not completed verification, add the connecting Google account as an OAuth test user or complete Google app verification.
 - If Google Contacts returns `People API has not been used ... or it is disabled`, enable the Google People API in the Google Cloud project that owns your OAuth client, then wait a few minutes and reconnect/retry.
 - If Gmail cannot send, make sure the Gmail API is enabled and the connected Google account has granted Gmail permission through Composio.
-- Contact lookup, calendar availability, and Gmail guest notification actions use direct Composio router execution, not an LLM tool loop, to avoid sending large Composio tool schemas to Groq.
+- The ReAct model sees the small MCP wrapper schemas, while the Composio adapter
+  continues to route concrete Google actions internally.

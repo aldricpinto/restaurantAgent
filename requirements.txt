@@ -1,6 +1,8 @@
 langgraph
 langchain
+langchain-mcp-adapters
 langchain-groq
+mcp
 python-dotenv
 redis
 httpx
